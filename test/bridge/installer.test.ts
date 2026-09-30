@@ -3,6 +3,7 @@
 // 生产侧的 Node fs 适配（createNodeFs）只做结构校验，不触碰磁盘。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 import {
   installBridge,
   uninstallBridge,
@@ -11,6 +12,8 @@ import {
   bridgeTargetDirs,
   npmNodeModulesRootFrom,
   shouldSkipForeignTarget,
+  dedupeBridgeEntries,
+  countBridgeEntries,
   BRIDGE_BEGIN_MARK,
   BRIDGE_END_MARK,
   BRIDGE_BEGIN_MARK_WAS_EMPTY,
@@ -178,12 +181,11 @@ test('profile 目录缺失时返回 degraded 并带原因', () => {
 });
 
 test('[] 空数组场景：安装改写为块序列，卸载还原为 []', () => {
-  const profile = '/home/u/.dsh/profiles/web';
-  const patchPath = `${profile}/cordis.patch.yml`;
+  const { dshHome, profile, patchPath } = profileFixture();
   const original = '[]\n';
   const fs = makeMemFs({ [patchPath]: original });
   fs.mkdir(profile);
-  const opts = { dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext/bridge-client', fs };
+  const opts = { dshHome, bridgeSourceDir: '/ext/bridge-client', fs };
   const r = installBridge(opts);
   assert.equal(r.status, 'ok');
   const after = fs.readFile(patchPath);
@@ -197,13 +199,12 @@ test('[] 空数组场景：安装改写为块序列，卸载还原为 []', () =>
 });
 
 test('默认模板（注释 + []）改写为块序列，而非在 [] 后追加', () => {
-  const profile = '/home/u/.dsh/profiles/web';
-  const patchPath = `${profile}/cordis.patch.yml`;
+  const { dshHome, profile, patchPath } = profileFixture();
   // 模拟 DSH 初始化的真实默认文件：说明注释 + 顶层流式空数组 []
   const original = '# Your patch layer for this dsh profile\n# a top-level YAML array of loader patch entries\n[]\n';
   const fs = makeMemFs({ [patchPath]: original });
   fs.mkdir(profile);
-  const opts = { dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext/bridge-client', fs };
+  const opts = { dshHome, bridgeSourceDir: '/ext/bridge-client', fs };
   installBridge(opts);
   const after = fs.readFile(patchPath);
   assert.ok(after.includes(BRIDGE_BEGIN_MARK));
@@ -218,13 +219,12 @@ test('默认模板（注释 + []）改写为块序列，而非在 [] 后追加',
 });
 
 test('注释头 + [] 空数组：安装→卸载后字节级还原（不丢注释头）', () => {
-  const profile = '/home/u/.dsh/profiles/web';
-  const patchPath = `${profile}/cordis.patch.yml`;
+  const { dshHome, profile, patchPath } = profileFixture();
   // 模拟默认 profile 原始文件：3 行注释头 + []（实测 217 字节的形态）
   const init = '# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; `!!js` expressions allowed).\n[]\n';
   const fs = makeMemFs({ [patchPath]: init });
   fs.mkdir(profile);
-  const opts = { dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext/bridge-client', fs };
+  const opts = { dshHome, bridgeSourceDir: '/ext/bridge-client', fs };
   const r = installBridge(opts);
   assert.equal(r.status, 'ok');
   const after = fs.readFile(patchPath);
@@ -718,4 +718,192 @@ test('installBridge 在 patch 为默认空数组模板时也只写一条条目�
   const after = fs.readFile(patchPath);
   assert.equal(after.split(BRIDGE_BEGIN_MARK).length - 1, 1);
   assert.ok(after.includes('# 注释头'), '头部注释保留（卸载时才能字节级还原）');
+});
+
+// ——— 无标记旧条目（真实故障：文件里堆了 4 条，界面只表现为"能用"） ———
+// 早期版本写下的裸 insert 没有 begin/end 标记，而 DSH 对同 id 多条 insert 是
+// **静默追加**（dsh-app-boot 的 applyEntryPatches → data.push(...insert)，不查重不告警），
+// 于是重复会一直累积且无人察觉。下面三条把两种形态的识别、自愈、卸载全部钉死。
+
+/**
+ * 平台无关的 profile 夹具。
+ *
+ * 为什么需要：`detectProfileDir` 用 `path.join` 拼路径，在 Windows 上产生
+ * `\home\u\.dsh\profiles\web`，与用例里手写的 POSIX 字面量 `/home/u/.dsh/profiles/web`
+ * 不相等 → profile 判为不存在 → `installBridge` 直接返回 degraded，
+ * 于是断言全落在"没装成功"上，**被测逻辑根本没跑到**。
+ * 既有用例大量使用 POSIX 字面量，这正是本机 39 条环境性失败的来源之一。
+ * 新增用例一律用本夹具，确保在 Windows 与 CI(Ubuntu) 上都真正执行到被测分支。
+ */
+function profileFixture(): { dshHome: string; profile: string; patchPath: string } {
+  const dshHome = process.platform === 'win32' ? 'C:\\u\\.dsh' : '/u/.dsh';
+  const profile = join(dshHome, 'profiles', 'web');
+  return { dshHome, profile, patchPath: join(profile, 'cordis.patch.yml') };
+}
+
+/** 组装一条「无标记」的裸 insert 块（复刻早期版本的写法） */
+function bareBlock(): string {
+  return ['- insert:', `    - id: ${BRIDGE_PACKAGE_NAME}`, `      name: ${BRIDGE_PACKAGE_NAME}`].join('\n');
+}
+
+test('countBridgeEntries 同时识别带标记块与无标记裸 insert', () => {
+  const marked = [`${BRIDGE_BEGIN_MARK}`, bareBlock(), `${BRIDGE_END_MARK}`].join('\n');
+  assert.equal(countBridgeEntries(''), 0);
+  assert.equal(countBridgeEntries('# 用户内容\n- id: u\n  name: u\n'), 0);
+  assert.equal(countBridgeEntries(`${bareBlock()}\n`), 1, '无标记块应被识别');
+  assert.equal(countBridgeEntries(`${marked}\n`), 1);
+  assert.equal(countBridgeEntries(`${bareBlock()}\n${bareBlock()}\n`), 2);
+  assert.equal(countBridgeEntries(`${marked}\n\n${bareBlock()}\n`), 2, '混合形态也要都数到');
+});
+
+test('countBridgeEntries 不把「同一 insert 列表里混有其它 id」误判为桥接条目', () => {
+  // 注意缩进层级：两条 id 都在 insert 列表内（比 - insert: 多缩进），才是"混 id"。
+  // 这种 insert 不是纯桥接条目，整段删除风险高，必须不算数。
+  const mixedInList = [
+    '- insert:',
+    `    - id: ${BRIDGE_PACKAGE_NAME}`,
+    '      name: dsh-vscode-bridge',
+    '    - id: other',
+    '      name: other',
+  ].join('\n');
+  assert.equal(countBridgeEntries(`${mixedInList}\n`), 0);
+  // 对照：顶层 `- id: other` 是**另一个**顶层条目，与 insert 列表无关 →
+  // insert 列表本身仍是纯桥接的，应正常计为 1（不能因为文件里有别的插件就漏数）。
+  const otherTopLevel = ['- insert:', `    - id: ${BRIDGE_PACKAGE_NAME}`, '      name: dsh-vscode-bridge', '- id: other', '  name: other'].join('\n');
+  assert.equal(countBridgeEntries(`${otherTopLevel}\n`), 1);
+});
+
+test('dedupeBridgeEntries 把无标记旧条目归一为「一条 + 带标记」', () => {
+  const out = dedupeBridgeEntries(`# 用户内容\n- id: u\n  name: u\n\n${bareBlock()}\n`);
+  assert.equal(countBridgeEntries(out), 1, '应恰好剩一条');
+  assert.ok(out.includes(BRIDGE_BEGIN_MARK), '保留的无标记块应被补上 begin 标记（否则日后卸载不掉）');
+  assert.ok(out.includes(BRIDGE_END_MARK), '应补上 end 标记');
+  assert.ok(out.includes('id: u'), '用户内容必须保留');
+  // 幂等：再跑一次不再变化
+  assert.equal(dedupeBridgeEntries(out), out);
+});
+
+test('dedupeBridgeEntries 四份混合条目 → 只留带标记的那一条', () => {
+  // 复刻真实现场：2 处无标记（文件中部）+ 1 处无标记 + 1 处带标记（文件末尾）
+  const marked = [`${BRIDGE_BEGIN_MARK}`, bareBlock(), `${BRIDGE_END_MARK}`].join('\n');
+  const patch = `# 头部\n- id: dsh-codegraph\n  config:\n    frontload: false\n${bareBlock()}\n- id: ui-settings-general\n  name: x\n${bareBlock()}\n${bareBlock()}\n- id: ui-chat\n  name: y\n\n${marked}\n`;
+  const out = dedupeBridgeEntries(patch);
+  assert.equal(countBridgeEntries(out), 1, '四份应归一为一份');
+  assert.ok(out.includes(BRIDGE_BEGIN_MARK), '保留的是带标记的那份（卸载依赖标记）');
+  // 用户/其它插件内容一个都不能少
+  for (const keep of ['# 头部', 'dsh-codegraph', 'ui-settings-general', 'ui-chat']) {
+    assert.ok(out.includes(keep), `不得丢失 ${keep}`);
+  }
+});
+
+test('installBridge：patch 里只有无标记旧条目时，不再追加新条目（防累积）', () => {
+  const { dshHome, profile, patchPath } = profileFixture();
+  const fs = makeMemFs({ [patchPath]: `# 用户内容\n- id: u\n  name: u\n\n${bareBlock()}\n` });
+  fs.mkdir(profile);
+
+  const r = installBridge({ dshHome, bridgeSourceDir: '/ext/bridge-client', fs });
+  assert.equal(r.status, 'ok');
+  const after = fs.readFile(patchPath);
+  assert.equal(countBridgeEntries(after), 1, '无标记旧条目应被识别并归一，而不是再追加一条');
+  assert.ok(after.includes(BRIDGE_BEGIN_MARK), '归一后应带标记（否则日后卸载不掉）');
+  assert.ok(after.includes('id: u'), '用户内容保留');
+});
+
+test('installBridge 反复调用（30 次）后桥接条目始终恰好一条', () => {
+  // 这是「以后不要再导致这个问题」的直接防线：无论从哪种初始形态出发，
+  // 反复激活都不能让条目增长。DSH 侧对多条 insert 是静默追加，增长不会有任何报错。
+  const { dshHome, profile, patchPath } = profileFixture();
+  const seeds = [
+    '# 头部\n[]\n',                       // 默认空模板
+    '# 用户\n- id: u\n  name: u\n',        // 已有用户内容
+    `${bareBlock()}\n`,                   // 早期版本的无标记残留
+    `${bareBlock()}\n${bareBlock()}\n`,   // 已经重复过
+    // 真实现场的混合形态：无标记散在文件中部 + 带标记在末尾
+    `# 头部\n- id: other\n  name: other\n${bareBlock()}\n- id: tail\n  name: tail\n\n${BRIDGE_BEGIN_MARK}\n${bareBlock()}\n${BRIDGE_END_MARK}\n`,
+  ];
+  for (const seed of seeds) {
+    const fs = makeMemFs({ [patchPath]: seed });
+    fs.mkdir(profile);
+    const opts = { dshHome, bridgeSourceDir: '/ext/bridge-client', fs };
+    for (let i = 0; i < 30; i += 1) {
+      assert.equal(installBridge(opts).status, 'ok', `seed=${JSON.stringify(seed)} 第 ${i + 1} 次安装应成功`);
+    }
+    assert.equal(countBridgeEntries(fs.readFile(patchPath)), 1, `seed=${JSON.stringify(seed)} 30 次后仍应恰好一条`);
+  }
+});
+
+test('uninstallBridge 能删掉无标记的旧条目（否则"卸载了但还在跑"）', () => {
+  const { dshHome, profile, patchPath } = profileFixture();
+  const fs = makeMemFs({ [patchPath]: `# 用户内容\n- id: u\n  name: u\n\n${bareBlock()}\n` });
+  fs.mkdir(profile);
+
+  uninstallBridge({ dshHome, bridgeSourceDir: '/ext/bridge-client', fs });
+  const after = fs.readFile(patchPath);
+  assert.equal(countBridgeEntries(after), 0, '无标记条目也必须被删除');
+  assert.ok(after.includes('id: u'), '用户内容保留');
+});
+
+test('uninstallBridge 删掉混合形态（无标记 + 带标记）的全部条目', () => {
+  const { dshHome, profile, patchPath } = profileFixture();
+  const marked = [`${BRIDGE_BEGIN_MARK}`, bareBlock(), `${BRIDGE_END_MARK}`].join('\n');
+  const fs = makeMemFs({ [patchPath]: `# 用户内容\n- id: u\n  name: u\n\n${bareBlock()}\n\n${marked}\n` });
+  fs.mkdir(profile);
+
+  uninstallBridge({ dshHome, bridgeSourceDir: '/ext/bridge-client', fs });
+  const after = fs.readFile(patchPath);
+  assert.equal(countBridgeEntries(after), 0);
+  assert.ok(after.includes('id: u'), '用户内容保留');
+});
+
+test('uninstallBridge 后重新安装仍恰好一条（卸载-安装循环不累积）', () => {
+  const { dshHome, profile, patchPath } = profileFixture();
+  const fs = makeMemFs({ [patchPath]: `# 用户内容\n- id: u\n  name: u\n\n${bareBlock()}\n` });
+  fs.mkdir(profile);
+  const opts = { dshHome, bridgeSourceDir: '/ext/bridge-client', fs };
+  for (let i = 0; i < 3; i += 1) {
+    uninstallBridge(opts);
+    assert.equal(installBridge(opts).status, 'ok');
+    assert.equal(countBridgeEntries(fs.readFile(patchPath)), 1, `第 ${i + 1} 轮卸载-安装后应恰好一条`);
+  }
+  assert.ok(fs.readFile(patchPath).includes('id: u'));
+});
+
+// ——— 安装↔卸载的字节级还原（含空行敏感场景） ———
+// 这组用例的存在理由：上面几条还原断言原先用的是 POSIX 字面量路径，在 Windows 上
+// `detectProfileDir` 判为不存在 → installBridge 返回 degraded → 断言全落在
+// 「没装成功」上，**还原逻辑根本没被执行**。也就是说这个契约在本机长期是"假绿"。
+// 改用平台无关夹具后它们才真正生效，并立刻抓出一个真 bug：
+// 旧实现在删条目时顺手删掉了条目**前面的空行**，而空数组改写分支的 head 可能正以空行结尾
+// （`# 注释\n\n` + 条目），于是 `# 注释\n\n[]` 会被还原成 `# 注释\n[]`——丢了原始空行。
+test('安装→卸载字节级还原：空行敏感的注释头不能被吃掉', () => {
+  const { dshHome, profile, patchPath } = profileFixture();
+  const cases = [
+    '[]\n',
+    '# 用户自己的内容\n',
+    '# 用户\n- id: u\n  name: u\n',
+    '# 头部注释\n\n[]\n',                       // 注释与 [] 之间有空行（回归点）
+    '\n\n# 注释\n\n# 第二个注释\n\n[]\n',        // 多个空行
+    '# a\n# b\n[]\n',
+  ];
+  for (const original of cases) {
+    const fs = makeMemFs({ [patchPath]: original });
+    fs.mkdir(profile);
+    const opts = { dshHome, bridgeSourceDir: '/ext/bridge-client', fs };
+    assert.equal(installBridge(opts).status, 'ok', `安装应成功：${JSON.stringify(original)}`);
+    assert.equal(countBridgeEntries(fs.readFile(patchPath)), 1, `安装后应恰好一条：${JSON.stringify(original)}`);
+    uninstallBridge(opts);
+    assert.equal(fs.readFile(patchPath), original, `卸载应字节级还原：${JSON.stringify(original)}`);
+  }
+});
+
+test('空文件安装→卸载归一为 []（与 [] 无法区分，属既有有意行为）', () => {
+  // findEmptyArrayHead 对「空文件」与「[] 本身」都返回空 head，二者不可区分；
+  // 统一归一为 '[]\n'（DSH 语义上等价，都是空数组）。显式固化，避免日后误当 bug"修"。
+  const { dshHome, profile, patchPath } = profileFixture();
+  const fs = makeMemFs({ [patchPath]: '' });
+  fs.mkdir(profile);
+  const opts = { dshHome, bridgeSourceDir: '/ext/bridge-client', fs };
+  assert.equal(installBridge(opts).status, 'ok');
+  uninstallBridge(opts);
+  assert.equal(fs.readFile(patchPath), '[]\n');
 });

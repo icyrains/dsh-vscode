@@ -208,8 +208,12 @@ export function installBridge(opts: BridgeInstallOptions): BridgeInstallResult {
   // 读取现有 patch（不存在视为空，避免真实环境首次运行时 readFile 抛错）
   const existing = opts.fs.exists(patchPath) ? opts.fs.readFile(patchPath) : '';
 
-  if (existing.includes(BRIDGE_BEGIN_MARK)) {
-    // 已存在条目：先把可能出现的重复副本自愈掉（issue #19——重复条目会让 DSH 插件树崩溃），
+  // 判定「已安装」必须**两种形态都认**：带标记块 + 早期版本残留的无标记裸 insert。
+  // 只查 BRIDGE_BEGIN_MARK 的旧写法会让无标记文件走下面的「首次安装」分支，
+  // 于是每次激活都再追加一条 → 条目无限累积（真实故障：文件里堆了 4 条，
+  // 而 DSH 对同 id 多条 insert 是静默追加，界面上完全看不出问题）。
+  if (countBridgeEntries(existing) > 0) {
+    // 已存在条目：先归一为恰好一条（自愈重复副本 + 给无标记块补标记），
     // 再做"全部目标目录都必须可用"的判定（能读到含 `"name"` 的 package.json，
     // 且版本与插件随附版本一致——版本不一致说明是升级前的旧包，需强制重装刷新）。
     // 仅 exists 会漏掉「目录在但 package.json 不可读」的坏包（chmod 000 事故），
@@ -241,6 +245,13 @@ export function installBridge(opts: BridgeInstallOptions): BridgeInstallResult {
   // 首次安装：写条目前保存原文，供 copyDir 失败时回滚，绝不残留「有条目但包不可用」。
   const originalPatch = existing;
   writePatchEntry(opts.fs, patchPath, existing);
+  // 写入后硬校验：**恰好一条**。DSH 对同 id 多条 insert 是静默追加（不查重、不告警），
+  // 所以「只写一条」必须由我们保证。若这里不成立，宁可回滚成 degraded 也不留下坏配置——
+  // 让问题在日志里可见，而不是变成用户侧难以察觉的重复挂载。
+  if (countBridgeEntries(opts.fs.readFile(patchPath)) !== 1) {
+    opts.fs.writeFile(patchPath, originalPatch);
+    return { status: 'degraded', reason: 'patch entry count is not exactly 1 after write', profileDir, bridgeDir };
+  }
   let failedTarget = '';
   try {
     // 全部目标位置复制：每处都成功才算安装成功。
@@ -262,35 +273,139 @@ export function installBridge(opts: BridgeInstallOptions): BridgeInstallResult {
 }
 
 /**
- * 去掉重复的桥接条目，只保留第一段（issue #19）。
+ * 统计 patch 里「桥接条目」的份数（含无标记的旧版残留）。
  *
- * 现场：多个 VS Code 窗口同时激活、或旧版本残留，会让 cordis.patch.yml 里出现两段
- * `# dsh-vscode-bridge: begin/end`。DSH 侧同一 id 出现多条 insert 会让插件树崩溃
- * （用户报告：必须手工删掉重复项才能进入）。这里做幂等自愈：保留首段、删除后续段落。
+ * 存在意义：**同一 id 多条 insert 会被 DSH 静默叠加**——`dsh-app-boot` 的
+ * `applyEntryPatches` 对 insert 走的是 `data.push(...insert)`，纯追加、不查重、不告警
+ * （实测 `dsh --dump-config --profile web` 会把 4 条全部列进最终 loader 树）。
+ * 因此「只写一条」是必须由我们保证的不变量，需要一个可验证的计数函数。
  *
- * @returns 去重后的 patch 文本；本来只有一段（或没有）时原样返回
+ * @returns 桥接条目块的数量
  */
-export function dedupeBridgeEntries(patch: string): string {
-  if (!patch.includes(BRIDGE_BEGIN_MARK)) return patch;
-  // 逐段提取 begin..end（含标记行本身）；用全局匹配定位所有段落
-  const segRe = new RegExp(
-    `${escapeRegExp(BRIDGE_BEGIN_MARK)}[^\\n]*\\n[\\s\\S]*?${escapeRegExp(BRIDGE_END_MARK)}[^\\n]*`,
-    'g',
-  );
-  const segs = patch.match(segRe);
-  if (segs === null || segs.length <= 1) return patch;
-  let out = patch;
-  // 从后往前删，避免前面的删除影响后续匹配到的位置
-  for (let i = segs.length - 1; i >= 1; i -= 1) {
-    out = out.replace(segs[i], '');
-  }
-  // 删段后可能留下多余空行：折叠连续 3 个以上换行，避免文件越来越"松散"
-  return out.replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+export function countBridgeEntries(patch: string): number {
+  return findBridgeBlocks(patch.split('\n')).length;
 }
 
-/** 转义正则特殊字符（用于把标记文本当字面量匹配） */
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** 一个桥接条目块的行范围（0-based，含首尾行）与是否带 begin/end 标记 */
+interface BridgeBlock {
+  start: number;
+  end: number;
+  marked: boolean;
+}
+
+/** 是否为 begin 标记行（含 `was-empty-array` 元数据变体） */
+function isBeginMark(line: string): boolean {
+  return line.trim().startsWith(BRIDGE_BEGIN_MARK);
+}
+
+/** 是否为 end 标记行 */
+function isEndMark(line: string): boolean {
+  return line.trim().startsWith(BRIDGE_END_MARK);
+}
+
+/** 顶层 `- insert:` 行 */
+function isInsertLine(line: string): boolean {
+  return /^- insert:\s*$/.test(line);
+}
+
+/** insert 列表里的一个 `- id: xxx` 行 */
+function idOf(line: string): string | null {
+  const m = /^\s+-\s*id:\s*(\S+)\s*$/.exec(line);
+  return m === null ? null : m[1];
+}
+
+/**
+ * 定位 patch 里的全部桥接条目块，分两种形态：
+ *
+ * 1. **带标记块**：`# dsh-vscode-bridge: begin` … `# dsh-vscode-bridge: end`（当前版本写法）；
+ * 2. **无标记块**：顶层 `- insert:` 且其条目列表**全部**是 `id: dsh-vscode-bridge`
+ *    ——早期版本残留的形态（只写裸 insert，没有标记）。
+ *
+ * 形态 2 必须被识别：早期版本写的条目对「只匹配 begin..end」的旧实现完全不可见，
+ * 于是自愈永远不生效（真实故障：文件里累积了 4 条，界面只表现为「能用」，无从察觉）。
+ *
+ * 保守性：begin 有配对 end 才算块（标记不完整则整段忽略，绝不猜着删用户内容）；
+ * insert 列表里若混有其它 id，则**不整段删除**（那不是纯桥接条目），只跳过。
+ */
+function findBridgeBlocks(lines: string[]): BridgeBlock[] {
+  const blocks: BridgeBlock[] = [];
+  const covered = new Array<boolean>(lines.length).fill(false);
+
+  // ① 带标记块
+  for (let i = 0; i < lines.length; i += 1) {
+    if (covered[i] || !isBeginMark(lines[i])) continue;
+    let j = i;
+    while (j < lines.length && !isEndMark(lines[j])) {
+      // 撞到下一个 begin 说明标记没配对：放弃该段（保守，不删）
+      if (j > i && isBeginMark(lines[j])) break;
+      j += 1;
+    }
+    if (j >= lines.length || !isEndMark(lines[j])) continue;
+    for (let k = i; k <= j; k += 1) covered[k] = true;
+    blocks.push({ start: i, end: j, marked: true });
+    i = j;
+  }
+
+  // ② 无标记的裸 insert 块（跳过已归属标记块的行）
+  for (let i = 0; i < lines.length; i += 1) {
+    if (covered[i] || !isInsertLine(lines[i])) continue;
+    let j = i;
+    while (j + 1 < lines.length && /^\s+\S/.test(lines[j + 1])) j += 1;
+    const body = lines.slice(i + 1, j + 1);
+    const ids = body.map(idOf).filter((id): id is string => id !== null);
+    // 必须命中桥接，且列表里没有别的 id（否则不是纯桥接条目，整段删除风险高）
+    if (ids.length === 0 || ids.some((id) => id !== BRIDGE_PACKAGE_NAME)) continue;
+    blocks.push({ start: i, end: j, marked: false });
+    for (let k = i; k <= j; k += 1) covered[k] = true;
+    i = j;
+  }
+
+  return blocks;
+}
+
+/**
+ * 把 patch 里的桥接条目**归一为恰好一条**（幂等自愈）。
+ *
+ * 为什么需要：DSH 对同 id 的多条 insert 是**静默追加**而非覆盖
+ * （`dsh-app-boot` 的 `applyEntryPatches` → `data.push(...insert)`），
+ * 多条并存会让插件被重复挂载，且 `dsh --dump-config` 之前的任何环节都不报错。
+ *
+ * 处理两种来源：带标记块的重复、以及早期版本残留的**无标记**裸 insert。
+ * 保留优先级：带标记块 > 无标记块（卸载依赖标记，故优先留带标记的）；
+ * 若只剩一个无标记块，就地补上标记，使其可被正常卸载。
+ *
+ * 不动用户内容：非桥接条目、以及混有其它 id 的 insert 一律原样保留。
+ * 空行清理只针对被删条目**自身带来的**那一行分隔，不做全局折叠
+ * （全局折叠会误改用户 YAML 块标量里的空行）。
+ *
+ * @returns 归一后的 patch 文本；本来就恰好一条（且带标记）时原样返回
+ */
+export function dedupeBridgeEntries(patch: string): string {
+  const lines = patch.split('\n');
+  const blocks = findBridgeBlocks(lines);
+  if (blocks.length === 0) return patch;
+  if (blocks.length === 1 && blocks[0].marked) return patch;
+
+  // 保留带标记的那一个；没有带标记的则保留第一个并补标记
+  const keepIdx = Math.max(0, blocks.findIndex((b) => b.marked));
+  const kept = blocks[keepIdx];
+
+  const drop = new Set<number>();
+  blocks.forEach((b, idx) => {
+    if (idx === keepIdx) return;
+    for (let k = b.start; k <= b.end; k += 1) drop.add(k);
+    // 追加条目时我们会在其前留一空行作分隔；删除该块时一并收掉这一行
+    if (b.start > 0 && lines[b.start - 1].trim() === '') drop.add(b.start - 1);
+  });
+
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (drop.has(i)) continue;
+    if (i === kept.start && !kept.marked) out.push(BRIDGE_BEGIN_MARK);
+    out.push(lines[i]);
+    if (i === kept.end && !kept.marked) out.push(BRIDGE_END_MARK);
+  }
+  return `${out.join('\n').trimEnd()}\n`;
 }
 
 /** 提取 Error 的 message（未知抛出物兜底为字符串化） */
@@ -298,33 +413,58 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** 卸载：删除带标记的 insert: 条目段（其余内容原样保留）+ 删除桥接目录 */
+/**
+ * 卸载：删除桥接条目（两种形态都删：带标记块 + 早期版本残留的无标记裸 insert）
+ * + 删除桥接目录。其余内容原样保留。
+ *
+ * 为什么必须认无标记块：早期版本写下的裸 insert 没有标记，只按标记删会**删不掉**，
+ * 于是「卸载后 DSH 里桥接仍在跑」——比装不上更难排查（用户已以为卸载完成）。
+ */
 export function uninstallBridge(opts: BridgeInstallOptions): void {
   const profileDir = detectProfileDir(opts.dshHome, opts.fs);
   if (profileDir === null) return;
   const patchPath = join(profileDir, 'cordis.patch.yml');
   if (!opts.fs.exists(patchPath)) return;
   const patch = opts.fs.readFile(patchPath);
+
+  // 空数组改写分支的还原元数据：只扫带标记段内部，避免误判用户内容里的同名文本
   const begin = patch.indexOf(BRIDGE_BEGIN_MARK);
   const end = patch.indexOf(BRIDGE_END_MARK);
-  if (begin === -1 || end === -1) return;
-  // 判断是否为空数组改写分支：begin 标记行携带 was-empty-array 元数据。
-  // 只扫描 begin~end 之间的条目段，避免误判用户自身内容里的同名文本。
-  const wasEmptyArray = patch.slice(begin, end).includes(BRIDGE_WAS_EMPTY_ARRAY_FLAG);
-  // 删除 begin 标记行到 end 标记行（含两行及其后随换行），剩余前后内容拼接
-  const restored = patch.slice(0, begin) + patch.slice(end + BRIDGE_END_MARK.length + 1);
-  if (wasEmptyArray) {
-    // 空数组改写分支：restored 即安装前的注释头，补回 []\n 实现字节级还原
-    opts.fs.writeFile(patchPath, `${restored}[]\n`);
-  } else {
-    // 用户内容分支：归一化（去掉因追加/删除引入的多余空行与尾随空白）
-    const normalized = restored.trim();
-    if (normalized === '') {
-      // 删除后仅剩空白：原为空数组/空文件，还原为 []
-      opts.fs.writeFile(patchPath, '[]\n');
+  const wasEmptyArray =
+    begin !== -1 && end !== -1 && patch.slice(begin, Math.max(begin, end)).includes(BRIDGE_WAS_EMPTY_ARRAY_FLAG);
+
+  const lines = patch.split('\n');
+  const blocks = findBridgeBlocks(lines);
+  if (blocks.length > 0) {
+    // 按**字符偏移**单趟拼接删除（而不是「过滤行后重新 join」）。
+    // 两个都必须注意的点（各自都踩过一次）：
+    //  1) 不能顺手删掉块**前面的空行**：空数组改写分支写入的是 `head + entry + '\n'`，
+    //     而 head 可能以空行结尾（`# 注释\n\n` + 条目）；连它一起删会把
+    //     `# 注释\n\n[]` 还原成 `# 注释\n[]`，丢掉原始空行（实测被独立验证抓出）。
+    //  2) `findBridgeBlocks` 返回的顺序**不是**位置序（先收标记块、再收无标记块），
+    //     所以不能按数组下标「从后往前」删——那样可能先删靠前的块，使后面块的偏移失效
+    //     （实测：混合形态卸载后漏删一条）。这里显式按 start 升序、单趟拼接，与顺序无关。
+    const lineStart: number[] = [];
+    let pos = 0;
+    for (const line of lines) {
+      lineStart.push(pos);
+      pos += line.length + 1; // +1 为换行符
+    }
+    let restored = '';
+    let cursor = 0;
+    for (const b of [...blocks].sort((x, y) => x.start - y.start)) {
+      restored += patch.slice(cursor, lineStart[b.start]);
+      // 连同块最后一行之后的换行一起删（安装时就是我们补上的）
+      cursor = Math.min(lineStart[b.end] + lines[b.end].length + 1, patch.length);
+    }
+    restored += patch.slice(cursor);
+    if (wasEmptyArray) {
+      // 空数组改写分支：restored 即安装前的注释头（原样，含空行），补回 [] 实现字节级还原
+      opts.fs.writeFile(patchPath, `${restored}[]\n`);
     } else {
-      // 用户内容：去尾随空白后补单个换行，与安装前一致
-      opts.fs.writeFile(patchPath, `${normalized}\n`);
+      // 追加分支：安装时引入过 `\n\n` 分隔，归一化尾随空白后补单个换行
+      const normalized = restored.trimEnd();
+      opts.fs.writeFile(patchPath, normalized === '' ? '[]\n' : `${normalized}\n`);
     }
   }
   const targets = bridgeTargetDirs(profileDir, opts.npmGlobalNodeModules);
