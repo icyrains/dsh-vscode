@@ -164,21 +164,21 @@
       "explorer/context": [
         {
           "command": "dsh.referenceToDsh",
-          "group": "dsh@1",
+          "group": "navigation@-1",
           "when": "resourceScheme == file"
         }
       ],
       "editor/title/context": [
         {
           "command": "dsh.referenceToDsh",
-          "group": "dsh@1",
+          "group": "navigation@-1",
           "when": "resourceScheme == file"
         }
       ],
       "editor/context": [
         {
           "command": "dsh.referenceToDsh",
-          "group": "dsh@1",
+          "group": "navigation@-1",
           "when": "editorIsOpen"
         }
       ],

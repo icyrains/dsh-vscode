@@ -108,6 +108,31 @@ test('#27 回归：活动编辑器变化不得触发面板刷新/重载链路', 
   }
 });
 
+// v0.5.0「引用到 DSH」的菜单位次：必须排在三处右键菜单的**最前面**（用户明确要求）。
+//
+// 这不是审美问题，而是 VS Code 的排序规则决定的硬约束——源码
+// src/vs/platform/actions/common/menuService.ts → MenuInfo.compareMenuItems 规定：
+//   空 group 排最后 → `navigation` 组**硬编码排最前** → 其余按 localeCompare 字典序
+//   → 组内按 order（`group@<order>` 的后缀在
+//   src/vs/workbench/services/actions/common/menusExtensionPoint.ts 里被剥离）→ 再按标题。
+// 所以：
+//   · 组名必须是 `navigation`（`dsh` 会被字典序压到 copilot 之后、navigation 之前 → 实测第 16/28/4 位）；
+//   · order 必须为负（Codix 的 "Add File to Codix" 是同组 order 0，负值才能排到它前面）。
+// 两者缺一都会「看起来只是排在后面」这种难以察觉的软失败，故在此固化。
+test('v0.5.0：引用到 DSH 在三处右键菜单都用 navigation@-1（排最前、且在 Add File to Codix 之前）', () => {
+  const p = pkg();
+  for (const menu of ['explorer/context', 'editor/context', 'editor/title/context']) {
+    const items = (p.contributes.menus[menu] ?? []) as { command: string; group?: string }[];
+    const item = items.find((m) => m.command === 'dsh.referenceToDsh');
+    assert.ok(item, `${menu} 应贡献 dsh.referenceToDsh`);
+    assert.equal(
+      item.group,
+      'navigation@-1',
+      `${menu} 的 group 必须是 navigation@-1：navigation 组排最前，order=-1 才能排在同为 navigation 组、order=0 的「Add File to Codix」之前`,
+    );
+  }
+});
+
 // 缩放（issue #8）在 0.4.2 中保留：它是唯一需要"重渲染才生效"的设置项，
 // 上面 ③ 的断言依赖它仍然接线，这里同时固化"缩放不能被误删"。
 test('#27 回归：面板缩放仍接线且传参位置正确（0.4.2 保留 issue #8）', () => {

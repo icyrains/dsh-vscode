@@ -104,9 +104,19 @@ ctx.get("conversation").input.shell(sessionId).addFiles(references, attachmentId
 - **失败绝不静默**：定不到会话、输入框未就绪、正在发送而拒绝插入、面板未打开、页面超时……
   每个分支都有机读原因 + 用户可读文案两层，并写进扩展日志。页面回执按 `requestId` 配对，
   每条请求都有超时，命令不会悬挂。
+- **菜单位次必须用 `navigation@-1`，不能用自定义组名**（初版用了 `dsh@1`，用户反馈"太靠后"）。
+  这不是审美偏好，而是 VS Code 排序规则的硬约束——`MenuInfo.compareMenuItems`
+  （`src/vs/platform/actions/common/menuService.ts`）规定：空 group 排最后 →
+  **`navigation` 组硬编码排最前**（专门分支，不走字典序）→ 其余按字典序 → 组内按 order。
+  而 `group@<order>` 的 `@` 后缀会被剥离（`menusExtensionPoint.ts` 用 `lastIndexOf('@')`）。
+  所以「排最前」= 组名 `navigation` + order 为负。
+  实测（复刻官方算法、读本机真实扩展数据，见 `G:\DSH\menu-order-probe`）：
+  三处右键菜单都从第 16/28/4 位变为**第 1 位**，且都排在同为 `navigation` 组、order 0 的
+  Codix「Add File to Codix」**之前**。该契约已由 `test/package.test.ts` 的专门测试固化。
 
 > 注意：插入逻辑跑在 **DSH 页面内的桥接 bundle** 里，属扩展侧改动 →
 > **必须 `Developer: Reload Window` 后生效**（与改动 2 同理）。
+> 菜单项的 group 改动同理：VS Code 在窗口加载时读取扩展清单，也需重载窗口。
 
 ---
 

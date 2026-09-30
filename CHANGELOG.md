@@ -18,14 +18,20 @@
     这样既不硬依赖 `uiWorkspace` 服务，也不会在服务缺失时彻底失效。
   - **失败绝不静默**：定不到会话、输入框未就绪、正在发送而拒绝插入、面板未打开、页面超时……
     每个分支都有明确文案（机读原因 + 用户可读文案两层），并写进扩展日志。
+  - **菜单位次：三处右键菜单都排在第一位**。菜单项的 group 用 `navigation@-1`：
+    VS Code 的 `MenuInfo.compareMenuItems` 规定空 group 排最后、**`navigation` 组硬编码排最前**
+    （专门分支，不走字典序），其余按字典序，组内按 order（`group@<order>` 的后缀会被剥离）。
+    因此「排最前」= 组名 `navigation` + 负 order。初版用的是自定义组 `dsh@1`，会被字典序压到
+    第 16/28/4 位（用户反馈"太靠后"）。改后实测三处均为**第 1 位**，且都排在同为 `navigation` 组、
+    order 0 的「Add File to Codix」之前。该契约由 `test/package.test.ts` 的专门测试固化。
   - **桥接仍需重载窗口**：插入逻辑跑在 DSH 页面内的桥接 bundle 里，属扩展侧改动，
-    需 `Developer: Reload Window` 后生效。
+    需 `Developer: Reload Window` 后生效（菜单 group 的改动同理，清单在窗口加载时读取）。
 
 ### 测试
 
-测试用例由 328 增至 364（新增 36 条：相对化/mention/载荷生成等纯逻辑 25 条，
+测试用例由 328 增至 365（新增 37 条：相对化/mention/载荷生成等纯逻辑 25 条，菜单位次契约 1 条，
 面板转发链路的静态守卫 1 条，以及在**真实构建产物**上运行、断言「确实调用了 DSH 原生 `addFiles`」的端到端 10 条）。
-`npm run typecheck` 无错误，`npm test` 364/364 全绿
+`npm run typecheck` 无错误，`npm test` 365/365 全绿
 （CI 为 Ubuntu；本机 Windows 另有 39 条**既有**环境性失败——硬编码 POSIX 路径的用例在 Windows 上必然失败、
 `dsh` 不在 PATH 的真实链路用例，与本次改动无关，改动前后数量一致）。
 
