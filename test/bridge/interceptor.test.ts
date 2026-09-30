@@ -98,6 +98,8 @@ function loadBridge(opts: { fetch: (input: unknown, init: any) => Promise<Respon
       (docListeners.get(type) ?? (docListeners.set(type, new Set()).get(type)!)).add(fn);
     },
     activeElement: null,
+    // 改动 Diff 的取数 URL 按 document.baseURI 解析（与真实页面一致：服务地址 + '/'）
+    baseURI: 'http://127.0.0.1:3080/',
     // undo/redo 返回 false：模拟「React 受控输入框原生撤销栈为空」，强制走桥接手动手栈
     execCommand(cmd: string) { return cmd !== 'undo' && cmd !== 'redo'; },
     createElement() { return { textContent: '', style: {}, append() {}, setAttribute() {}, addEventListener() {} }; },
@@ -116,6 +118,10 @@ function loadBridge(opts: { fetch: (input: unknown, init: any) => Promise<Respon
     fetch: globalThis.fetch,
     setTimeout,
     clearTimeout,
+    // —— v0.4.3 改动 Diff 链路需要的 Web API（vm 新 context 只带 ECMAScript 内置） ——
+    URL: globalThis.URL,
+    URLSearchParams: globalThis.URLSearchParams,
+    CSS: { escape: (s: string) => String(s).replace(/["\\]/g, '\\$&') },
     // —— 撤销/重做测试用 DOM 桩 ——
     Event: class { type: string; bubbles: boolean; constructor(type: string, opts?: { bubbles?: boolean }) { this.type = type; this.bubbles = !!(opts && opts.bubbles); } },
     HTMLTextAreaElement: {
@@ -613,6 +619,381 @@ test('issue #6：Cmd+Z 撤销 / Cmd+Shift+Z 重做（原生 execCommand 失效�
     // 重做第二段 → hello world
     keydown({ key: 'z', metaKey: true, ctrlKey: false, shiftKey: true, preventDefault() {}, stopPropagation() {} });
     assert.equal(ta._v, 'hello world', '再次重做应恢复 hello world');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+// ——— v0.4.3：「本轮文件改动」在 VS Code 中打开 Diff（真实产物 + DOM 桩端到端） ———
+
+/**
+ * 构造 DSH「本轮文件改动」卡片的 DOM 桩，形状按 DSH 0.2.0-rc.1 的真实产物：
+ *   <div data-conversation-session="s-1">
+ *     <div data-changed-files>
+ *       <button aria-describedby=":r1:-0">   ← 行按钮（index 从后缀解析）
+ *       <span id=":r1:-0" hidden>/ws/src/a.ts</span>  ← 绝对路径
+ *       <button aria-expanded="false">       ← 展开/收起（必须排除）
+ *   parent.closest('[data-changed-files]') / card.querySelectorAll('[aria-describedby]')
+ *   / card.querySelector('[id="…"]') 都要按真实语义工作。
+ */
+function changedFilesCard(opts: {
+  sessionId: string;
+  /** 相对路径列表（摘要里的 path），用于生成绝对路径与 hidden span */
+  relPaths: string[];
+  /** 行按钮的 aria-describedby 后缀是否带 index（多文件卡片为 true） */
+  indexedAria?: boolean;
+}) {
+  const abs = (rel: string) => '/ws/' + rel;
+  const idxOf = (i: number) => (opts.indexedAria === false ? '' : `-${i}`);
+  const spans = new Map<string, any>();
+  const rows: any[] = [];
+  opts.relPaths.forEach((rel, i) => {
+    const described = `:r1:${idxOf(i)}`;
+    const span = { textContent: abs(rel), getAttribute: () => null };
+    spans.set(`${described}`, span);
+    rows.push({
+      described,
+      attrs: { 'aria-describedby': described },
+    });
+  });
+  const toggle = { attrs: { 'aria-expanded': 'false' } };
+  return {
+    abs,
+    toggle,
+    rows,
+    build() {
+      const card: any = {
+        closest(sel: string) { return sel === '[data-changed-files]' ? card : null; },
+        querySelectorAll(sel: string) {
+          if (sel !== '[aria-describedby]') return [];
+          return rows.map((r) => ({
+            getAttribute: (n: string) => (n === 'aria-describedby' ? r.described : null),
+          }));
+        },
+        querySelector(sel: string) {
+          const m = /^\[id="(.*)"\]$/.exec(sel);
+          if (!m) return null;
+          return spans.get(m[1]!) ?? null;
+        },
+      };
+      return card;
+    },
+  };
+}
+
+/** 把「命中卡片 / 命中行按钮 / 命中展开控件」三类元素接到统一的 click 事件上 */
+function clickBridge(b: {
+  emitDoc: (t: string, e: unknown) => void;
+  documentStub?: unknown;
+}, target: any, extra: Record<string, unknown> = {}) {
+  const ev = {
+    target,
+    preventDefault() { (ev as any).prevented = true; },
+    stopPropagation() { (ev as any).stopped = true; },
+    ...extra,
+  };
+  b.emitDoc('click', ev);
+  return ev as any;
+}
+
+test('v0.4.3：点击改动卡片行按钮 → 现取 diff 并转发 openDiff（坐标由旁路观测得到）', async () => {
+  const card = changedFilesCard({ sessionId: 's-1', relPaths: ['src/a.ts'] });
+  const cardEl = card.build();
+  const rowBtn: any = {
+    attrs: { 'aria-describedby': ':r1:-0' },
+    closest: (sel: string) => (sel === 'button' ? rowBtn : sel === '[data-changed-files]' ? cardEl : null),
+    getAttribute(name: string) { return (rowBtn.attrs as any)[name] ?? null; },
+    matches: () => false,
+  };
+  const sessionRoot = {
+    closest: (sel: string) =>
+      sel === '[data-conversation-session]'
+        ? { getAttribute: () => 's-1' }
+        : sel === '[data-sidebar-right-session]'
+          ? null
+          : null,
+  };
+  // 行按钮自身兼作「会话根」查找入口：closest 需同时支持两种选择器
+  rowBtn.closest = (sel: string) => {
+    if (sel === 'button') return rowBtn;
+    if (sel === '[data-changed-files]') return cardEl;
+    if (sel === '[data-conversation-session]' || sel === '[data-sidebar-right-session]') return sessionRoot.closest(sel);
+    return null;
+  };
+  rowBtn.getAttribute = (name: string) => {
+    if (name === 'aria-describedby') return ':r1:-0';
+    return null;
+  };
+  // 卡片自身也要能回答 findSessionId（它从被点元素向上找会话根）
+  cardEl.closest = (sel: string) => (sel === '[data-changed-files]' ? cardEl : sessionRoot.closest(sel));
+
+  const asked: string[] = [];
+  const DIFF = {
+    kind: 'text', path: 'src/a.ts', display: 'src/a.ts',
+    before: true, after: true,
+    hunks: [{ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2, lines: ['-old', '+new'] }],
+  };
+  const fakeRealFetch = async (input: unknown, _init: any) => {
+    const url = typeof input === 'string' ? input : (input as any)?.href ?? '';
+    asked.push(url);
+    if (url.includes('changes.summary')) {
+      return jsonResponse({ turn: 1, files: [{ path: 'src/a.ts', display: 'src/a.ts', added: 1, deleted: 1 }], total: 1, added: 1, deleted: 1 });
+    }
+    if (url.includes('changes.diff')) return jsonResponse(DIFF);
+    return jsonResponse(ACCEPT_BODY);
+  };
+
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    b.parentMessages.length = 0; // 丢掉握手回执
+
+    // 模拟 DSH 渲染卡片时主动拉取 summary（真实行为：卡片渲染即取 summary）
+    await b.window.fetch('api/changes.summary?sessionId=s-1&seq=5');
+    // 等旁路观测的克隆体解析入缓存
+    await new Promise((r) => setTimeout(r, 30));
+
+    const ev = clickBridge(b, rowBtn);
+    assert.equal(ev.prevented, true, '应接管点击，避免打开 DSH 自己的 review 视图');
+    // 按需取数后转发（异步）
+    await new Promise((r) => setTimeout(r, 60));
+
+    const openDiffs = b.parentMessages.filter((m) => m.kind === 'openDiff');
+    assert.equal(openDiffs.length, 1, `应转发一条 openDiff，实际 ${JSON.stringify(b.parentMessages)}`);
+    assert.equal(openDiffs[0].path, 'src/a.ts');
+    assert.deepEqual(openDiffs[0].diff, DIFF, '应转发服务端权威 diff（hunks）');
+    assert.ok(asked.some((u) => u.includes('changes.diff')), '未命中缓存时应现取 diff');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.4.3：点击「展开/收起全部」控件不得被当成文件行（否则误弹 diff）', async () => {
+  const cardEl: any = {
+    closest(sel: string) { return sel === '[data-changed-files]' ? cardEl : null; },
+    querySelectorAll() { return []; },
+    querySelector() { return null; },
+  };
+  const toggleBtn: any = {
+    closest: (sel: string) => (sel === 'button' || sel === '[data-changed-files]' ? (sel === '[data-changed-files]' ? cardEl : toggleBtn) : null),
+    getAttribute: () => null,
+    matches: (sel: string) => sel === '[aria-expanded]',
+  };
+  const fakeRealFetch = async () => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    b.parentMessages.length = 0;
+    await b.window.fetch('api/changes.summary?sessionId=s-1&seq=5');
+    await new Promise((r) => setTimeout(r, 30));
+
+    const ev = clickBridge(b, toggleBtn);
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(!!ev.prevented, false, '展开控件不应被接管（交给 DSH 原生展开逻辑）');
+    assert.equal(b.parentMessages.filter((m) => m.kind === 'openDiff').length, 0, '不应弹 diff');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.4.3：点旧卡片（同一文件多轮都改过）→ 用轮次号取那一轮，绝不显示最新一轮的 diff', async () => {
+  // 复现 F2：三轮都只改了 src/a.ts。旧逻辑按「路径指纹 + 取最新 seq」必中第 3 轮，
+  // 于是点第 1 轮的卡片会显示第 3 轮的 diff。现在必须以 data-turn-tail 消歧。
+  const DIFF1 = {
+    kind: 'text', path: 'src/a.ts', display: 'src/a.ts', before: true, after: true,
+    hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-v1', '+v2'] }],
+  };
+  const DIFF3 = {
+    kind: 'text', path: 'src/a.ts', display: 'src/a.ts', before: true, after: true,
+    hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-v3', '+v4'] }],
+  };
+  const turnHost = { getAttribute: (n: string) => (n === 'data-turn-tail' ? '1' : null) };
+  const cardEl: any = {
+    closest(sel: string) {
+      if (sel === '[data-changed-files]') return cardEl;
+      if (sel === '[data-turn-tail]') return turnHost; // 点的是第 1 轮的卡片
+      return null;
+    },
+    querySelectorAll(sel: string) {
+      if (sel !== '[aria-describedby]') return [];
+      return [{ getAttribute: (n: string) => (n === 'aria-describedby' ? ':r1:-0' : null) }];
+    },
+    querySelector(sel: string) {
+      const m = /^\[id="(.*)"\]$/.exec(sel);
+      if (!m) {
+        // 新实现按 [id] 遍历，不再拼属性选择器
+        return null;
+      }
+      return m[1] === ':r1:-0' ? { textContent: '/ws/src/a.ts' } : null;
+    },
+  };
+  const rowBtn: any = {
+    closest(sel: string) {
+      if (sel === 'button') return rowBtn;
+      if (sel === '[data-changed-files]') return cardEl;
+      if (sel === '[data-turn-tail]') return turnHost;
+      if (sel === '[data-conversation-session]') return { getAttribute: () => 's-1' };
+      if (sel === '[data-sidebar-right-session]') return null;
+      return null;
+    },
+    getAttribute: (n: string) => (n === 'aria-describedby' ? ':r1:-0' : null),
+    matches: () => false,
+    querySelectorAll: () => [], // 供 cardPathsOf 之外的分支（本分支不需要）
+  };
+  // cardPathsOf 走 querySelectorAll("[id]") —— 补上真实语义
+  const idSpan = { getAttribute: (n: string) => (n === 'id' ? ':r1:-0' : null), textContent: '/ws/src/a.ts' };
+  cardEl.querySelectorAll = (sel: string) => {
+    if (sel === '[id]') return [idSpan];
+    if (sel === '[aria-describedby]') return [{ getAttribute: () => ':r1:-0' }];
+    return [];
+  };
+  // 卡片自身也要能回答 findSessionId（它从被点元素向上找会话根）
+  const sessionHost = { getAttribute: () => 's-1' };
+  cardEl.closest = (sel: string) => {
+    if (sel === '[data-changed-files]') return cardEl;
+    if (sel === '[data-turn-tail]') return turnHost;
+    if (sel === '[data-conversation-session]') return sessionHost;
+    return null;
+  };
+
+  const asked: string[] = [];
+  const fakeRealFetch = async (input: unknown) => {
+    const url = typeof input === 'string' ? input : (input as any)?.href ?? '';
+    asked.push(url);
+    if (url.includes('changes.summary')) {
+      // 同一文件的三轮：seq 10/20/30，turn 1/2/3
+      const seq = Number(/seq=(\d+)/.exec(url)?.[1] ?? '0');
+      const turn = seq === 10 ? 1 : seq === 20 ? 2 : 3;
+      return jsonResponse({ turn, files: [{ path: 'src/a.ts', display: 'src/a.ts', added: 1, deleted: 1 }], total: 1, added: 1, deleted: 1 });
+    }
+    if (url.includes('changes.diff')) {
+      // 按 seq 返回那一轮的 diff
+      return jsonResponse(url.includes('seq=10') ? DIFF1 : DIFF3);
+    }
+    return jsonResponse(ACCEPT_BODY);
+  };
+
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    b.parentMessages.length = 0;
+    // 三轮 summary 都已被 DSH 拉取过（真实场景：用户往上翻过历史）
+    for (const seq of [10, 20, 30]) {
+      await b.window.fetch(`api/changes.summary?sessionId=s-1&seq=${seq}`);
+    }
+    await new Promise((r) => setTimeout(r, 30));
+
+    clickBridge(b, rowBtn);
+    await new Promise((r) => setTimeout(r, 60));
+
+    const openDiffs = b.parentMessages.filter((m) => m.kind === 'openDiff');
+    assert.equal(openDiffs.length, 1, `应转发一条 openDiff，实际 ${JSON.stringify(b.parentMessages)}`);
+    assert.deepEqual(openDiffs[0].diff, DIFF1, '必须显示第 1 轮的 diff，而不是最新一轮');
+    assert.ok(asked.some((u) => u.includes('changes.diff') && u.includes('seq=10')), `应取第 1 轮的 diff，实际请求：${asked.join(', ')}`);
+    // 注意：预取三轮 summary 时本就会请求 seq=30 的 **summary**；
+    // 这里要断言的是**不得为第 3 轮取 diff**。
+    assert.ok(
+      !asked.some((u) => u.includes('changes.diff') && u.includes('seq=30')),
+      '不得误取第 3 轮的 diff',
+    );
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.4.3：同一文件连点两次 → 只弹一个 diff（in-flight 去重，不重复动作）', async () => {
+  const card = changedFilesCard({ sessionId: 's-1', relPaths: ['src/a.ts'] });
+  const cardEl = card.build();
+  const rowBtn: any = {
+    closest(sel: string) {
+      if (sel === 'button') return rowBtn;
+      if (sel === '[data-changed-files]') return cardEl;
+      if (sel === '[data-conversation-session]') return { getAttribute: () => 's-1' };
+      return null;
+    },
+    getAttribute: (n: string) => (n === 'aria-describedby' ? ':r1:-0' : null),
+    matches: () => false,
+  };
+  cardEl.closest = (sel: string) => (sel === '[data-changed-files]' ? cardEl : sel === '[data-conversation-session]' ? { getAttribute: () => 's-1' } : null);
+
+  const DIFF = {
+    kind: 'text', path: 'src/a.ts', display: 'src/a.ts', before: true, after: true,
+    hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-old', '+new'] }],
+  };
+  let diffCalls = 0;
+  const fakeRealFetch = async (input: unknown) => {
+    const url = typeof input === 'string' ? input : (input as any)?.href ?? '';
+    if (url.includes('changes.summary')) {
+      return jsonResponse({ turn: 1, files: [{ path: 'src/a.ts', display: 'src/a.ts', added: 1, deleted: 1 }], total: 1, added: 1, deleted: 1 });
+    }
+    if (url.includes('changes.diff')) {
+      diffCalls += 1;
+      // 故意延迟，制造「第一次还没回来就点了第二次」的窗口
+      await new Promise((r) => setTimeout(r, 40));
+      return jsonResponse(DIFF);
+    }
+    return jsonResponse(ACCEPT_BODY);
+  };
+
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    b.parentMessages.length = 0;
+    await b.window.fetch('api/changes.summary?sessionId=s-1&seq=5');
+    await new Promise((r) => setTimeout(r, 30));
+
+    // 连点两次（第二次在第一次 fetch 完成之前）
+    clickBridge(b, rowBtn);
+    clickBridge(b, rowBtn);
+    await new Promise((r) => setTimeout(r, 120));
+
+    const openDiffs = b.parentMessages.filter((m) => m.kind === 'openDiff');
+    assert.equal(openDiffs.length, 1, `连点不应弹多个 diff，实际 ${openDiffs.length} 个`);
+    assert.equal(diffCalls, 1, `不应重复发起取数，实际 ${diffCalls} 次`);
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.4.3：点击普通文件入口（非改动卡片）→ 转发 openFile 且携带当前会话 cwd', async () => {
+  const CWD = 'G:\\projA';
+  const fileBtn: any = {
+    title: 'docs/readme.md',
+    // 真实 closest 接受「选择器列表」（逗号分隔），需按子串匹配 fileMention 那一支
+    closest: (sel: string) => {
+      if (sel.includes('fileMention')) return fileBtn;
+      if (sel === '[data-changed-files]') return null;
+      if (sel === '[data-conversation-session]') return { getAttribute: () => 's-A' };
+      return null;
+    },
+    getAttribute(name: string) { return name === 'title' ? fileBtn.title : null; },
+    matches: () => false,
+  };
+  const fakeRealFetch = async () => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    // 先 apply 并注入 cordis 上下文（提供 sessions 服务 → 会话 cwd）
+    const app = b.apply();
+    const fakeCtx = {
+      get: (name: string) =>
+        name === 'sessions'
+          ? { list: { getSnapshot: () => ({ ids: ['s-A'], byId: { 's-A': { id: 's-A', cwd: CWD } } }) } }
+          : undefined,
+    };
+    app.apply(fakeCtx);
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    b.parentMessages.length = 0;
+
+    clickBridge(b, fileBtn);
+    const opens = b.parentMessages.filter((m) => m.kind === 'openFile');
+    assert.equal(opens.length, 1, `应转发一条 openFile，实际 ${JSON.stringify(b.parentMessages)}`);
+    assert.equal(opens[0].path, 'docs/readme.md');
+    // 关键：必须带上「当前 DSH 会话的工作区」，而不是让扩展退回 VS Code 工作区根
+    assert.equal(opens[0].cwd, CWD, '相对路径应按当前 DSH 会话工作区解析');
   } finally {
     rmSync(b.outDir, { recursive: true, force: true });
   }

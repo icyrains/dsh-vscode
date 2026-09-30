@@ -95,10 +95,16 @@ test('#27 回归：活动编辑器变化不得触发面板刷新/重载链路', 
   assert.ok(!provider.includes("kind: 'updateContextBar'"), '不得再有 updateContextBar 下行消息');
   // ⑤ 渲染不得注入"当前文件名"（#27 的放大器：文件名进 HTML → 每次文件切换 HTML 都不同）
   assert.ok(!provider.includes('fileLabel'), 'provider 不得再向模板注入 fileLabel');
-  // ⑥ 已撤回的右键菜单块不得复活
+  // ⑥ 已撤回的右键菜单块不得复活（v0.5.0：仅放行 dsh.referenceToDsh 一项）
   const p = pkg();
   for (const menu of ['editor/context', 'explorer/context', 'editor/title/context']) {
-    assert.equal(p.contributes.menus[menu], undefined, `菜单块 ${menu} 应已移除`);
+    const items = p.contributes.menus[menu] as { command: string }[] | undefined;
+    if (items === undefined) continue;
+    // v0.5.0「引用到 DSH」有意恢复了这三处右键入口；除此之外不得再有任何菜单项，
+    // 尤其不得复活 0.4.2 撤回的上下文工具条命令（addFileContext / askAbout*）。
+    const allowed = new Set(['dsh.referenceToDsh']);
+    const extra = items.filter((m) => !allowed.has(m.command)).map((m) => m.command);
+    assert.deepEqual(extra, [], `菜单块 ${menu} 只允许 dsh.referenceToDsh，不得复活已撤回的命令`);
   }
 });
 
@@ -144,13 +150,15 @@ test('README 中英与 CHANGELOG 声明的测试数等于实际测试数', () =>
     assert.equal(Number(m[1]), count, `${file} 声明的测试数应与实际一致（实际 ${count}）`);
   }
 
-  // ③ CHANGELOG：0.4.2 段落的 "npm test X/X 全绿" 与 "由 A 降至 X"
+  // ③ CHANGELOG：最新段落的 "npm test X/X 全绿" 与测试数变化声明。
+  //     注意：0.4.2 的撤回让测试数「下降」，0.4.3 新增能力后「上升」，
+  //     因此这里只校验「变化声明与实际数字一致」，不假定变化方向。
   const changelog = readFileSync(join(root, 'CHANGELOG.md'), 'utf8');
   const green = /`npm test` (\d+)\/\1 全绿/.exec(changelog);
   assert.ok(green, 'CHANGELOG 应写明 npm test 全绿的数量');
   assert.equal(Number(green[1]), count, 'CHANGELOG 的 npm test 数字应与实际一致');
-  const dropped = /测试用例由 (\d+) 降至 (\d+)/.exec(changelog);
-  assert.ok(dropped, 'CHANGELOG 应写明测试数的变化');
-  assert.equal(Number(dropped[2]), count, 'CHANGELOG 的"降至"数字应与实际一致');
-  assert.ok(Number(dropped[1]) > Number(dropped[2]), '撤回后测试数应下降');
+  const changed = /测试用例由 (\d+) (?:降至|增至) (\d+)/.exec(changelog);
+  assert.ok(changed, 'CHANGELOG 应写明测试数的变化');
+  assert.equal(Number(changed[2]), count, 'CHANGELOG 的变化后数字应与实际一致');
+  assert.notEqual(Number(changed[1]), Number(changed[2]), '变化声明的前后数字不应相同');
 });

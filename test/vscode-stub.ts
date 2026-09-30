@@ -7,6 +7,8 @@ export const workspace = {
   getConfiguration: () => ({
     get: () => undefined,
   }),
+  // v0.4.3：Diff 旧侧内存文档提供者的注册点（单测里只返回可释放句柄）
+  registerTextDocumentContentProvider: (_scheme: string, _provider: unknown) => ({ dispose: () => {} }),
 };
 
 export const window = {
@@ -28,9 +30,40 @@ export const commands = {
   executeCommand: async () => undefined,
 };
 
+/**
+ * 极简 Uri 桩：只需支持 diff-doc 用到的 `Uri.from({scheme, path})`
+ * 以及已被引用的 `file` / `parse`。不实现 VS Code 的完整编码规则，
+ * 但保证被读到的 `scheme` / `path` / `toString()` 语义正确。
+ */
 export const Uri = {
-  file: (p: string) => ({ fsPath: p }),
-  parse: (s: string) => ({ toString: () => s }),
+  file: (p: string) => ({
+    fsPath: p,
+    scheme: 'file',
+    path: p,
+    toString: () => 'file://' + p,
+  }),
+  parse: (s: string) => ({ scheme: '', path: s, fsPath: s, toString: () => s }),
+  from: (parts: { scheme: string; path: string }) => ({
+    scheme: parts.scheme,
+    path: parts.path,
+    fsPath: parts.path,
+    toString: () => `${parts.scheme}:${parts.path}`,
+  }),
 };
 
-export default { workspace, window, env, commands, Uri };
+/** 最小 EventEmitter：只需 event 与 dispose（内存文档内容存好后不再变化） */
+export class EventEmitter<T> {
+  private readonly listeners = new Set<(e: T) => void>();
+  readonly event = (listener: (e: T) => void) => {
+    this.listeners.add(listener);
+    return { dispose: () => this.listeners.delete(listener) };
+  };
+  fire(value: T): void {
+    for (const l of this.listeners) l(value);
+  }
+  dispose(): void {
+    this.listeners.clear();
+  }
+}
+
+export default { workspace, window, env, commands, Uri, EventEmitter };

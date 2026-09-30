@@ -152,6 +152,18 @@ test('readyPage 握手脚本携带 imageFallback 开关（v0.3.0）', () => {
   assert.ok(html2.includes('IMAGE_FALLBACK = false'));
 });
 
+test('readyPage 握手脚本包含「引用到 DSH」上下行转发（v0.5.0）', () => {
+  const html = readyPage('http://127.0.0.1:3080/', ctx(), { token: 'tok123', enabled: true });
+  // 下行：扩展宿主 bridgeInsertReference → iframe 的 insertReference（注意两段形状不同）
+  assert.ok(html.includes("type === 'bridgeInsertReference'"), '应接收扩展宿主的引用插入命令');
+  assert.ok(html.includes("kind: 'insertReference'"), '应把下行命令转成 iframe 侧的 kind 形状');
+  // 上行：iframe 的 insertReferenceAck → 扩展宿主的 bridgeInsertReferenceAck
+  assert.ok(html.includes("kind === 'insertReferenceAck'"), '应接收 iframe 的插入回执');
+  assert.ok(html.includes("type: 'bridgeInsertReferenceAck'"), '应把回执转给扩展宿主');
+  // 回执必须原样带上 requestId（扩展靠它配对等待中的请求），否则命令会挂到超时
+  assert.ok(/requestId: d\.requestId/.test(html), '回执应携带 requestId');
+});
+
 test('authRequiredPage 需要登录引导页：说明 + 输入框 + 提交经 postMessage 交扩展（v0.4.0 鉴权适配）', () => {
   initI18n('zh-cn');
   const html = authRequiredPage(t, ctx());

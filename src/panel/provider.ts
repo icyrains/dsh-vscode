@@ -4,6 +4,9 @@ import { randomUUID } from 'node:crypto';
 import * as nodeFs from 'node:fs/promises';
 import { ServiceManager } from '../service/manager';
 import { handleBridgeMessage } from '../bridge/host';
+import { DiffDocStore, beforeDocLabel } from '../bridge/diff-doc';
+import { buildInsertReferenceMessage } from '../../bridge-client/lib/core.js';
+import type { InsertReferenceEntry, InsertReferenceResult } from '../../bridge-client/lib/core.js';
 import { classifyRemote, toLocalhostUrl, type RemoteKind } from '../remote';
 import { t } from '../i18n';
 import {
@@ -45,6 +48,14 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
   private pendingExternalUrl: string | null = null;
   /** 渲染代数：递增使进行中的异步 URL 解析过期，防止乱序覆盖 */
   private renderGen = 0;
+  /**
+   * v0.5.0「引用到 DSH」：等待 iframe 回执的插入请求。
+   * 页面可能从未握手/无法响应，因此每条请求都带超时，绝不让命令悬挂。
+   */
+  private readonly pendingInserts = new Map<
+    string,
+    { resolve: (r: InsertReferenceResult) => void; timer: ReturnType<typeof setTimeout> }
+  >();
 
   /**
    * @param manager 服务管理器（面板与服务状态联动）
@@ -67,6 +78,12 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     private resolveExternalUrl: (url: string) => Promise<string> = async (u) => u,
     private imageFallback: () => boolean = () => true,
     private ui: PanelProviderUiOpts = {},
+    /**
+     * v0.4.3：Diff 旧侧的内存文档仓库（主/次面板共用一份）。
+     * 缺省时自建一份，保证单测与「忘记注入」的场景也能工作（不做静默降级，
+     * 只是失去内存复用；真正的失败仍会经 showWarning 上抛）。
+     */
+    private diffDocs: DiffDocStore = new DiffDocStore(),
   ) {
     // 订阅状态变化，重绘面板（iframe 与占位页由状态驱动，无白屏路径）
     manager.onChange(() => void this.handleStateChange());
@@ -77,6 +94,19 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     void this.handleStateChange();
   }
 
+  /** v0.5.0：面板当前是否可见（「引用到 DSH」优先投递给用户正看着的那个面板） */
+  isVisible(): boolean {
+    return this.view?.visible === true;
+  }
+
+  /**
+   * v0.5.0：面板是否已具备接收下行命令的条件（已 resolve + 服务就绪 + 非「远程未启用」占位页）。
+   * 不满足时 insertReferences 会给出精确原因，而不是让用户等到超时。
+   */
+  canReceiveCommands(): boolean {
+    return this.view !== null && this.manager.getSnapshot().state === 'ready' && !this.remoteWindowDisabled();
+  }
+
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
     // enableScripts 允许占位页的内联按钮脚本（nonce 放行）运行。
@@ -84,6 +114,9 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     // 由 Task 10 注册视图时通过第三参数传入（隐藏面板时保留 iframe 会话）。
     view.webview.options = { enableScripts: true };
     view.webview.onDidReceiveMessage((msg: PanelMessage) => this.onMessage(msg));
+    // v0.5.0：面板销毁时清偿等待中的引用插入请求，避免命令悬挂到超时。
+    // 用可选调用：真实 WebviewView 一定有 onDidDispose，但单测桩/未来宿主差异不该让渲染崩掉。
+    view.onDidDispose?.(() => this.abandonPendingInserts('panel-disposed'));
     if (!this.openedOnce) {
       this.openedOnce = true;
       this.onFirstOpen?.(); // 首次打开：触发一次性引导（如"移到右侧栏"提示）
@@ -159,6 +192,7 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
         break;
       case 'bridgeOpenExternal':
       case 'bridgeOpenFile':
+      case 'bridgeOpenDiff':
       case 'bridgeSaveImage':
       case 'bridgeDeleteImages':
         // 桥接消息统一走 host 的 handleBridgeMessage（外链/文件/图片落盘与删除，白名单与路径安全在 host 层）
@@ -167,6 +201,10 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
       case 'bridgeAck':
         // 握手回执：通知注入的回调（Task 7 据此评估桥接状态；version 供日志确认桥接代码版本）
         this.onBridgeAck?.(msg.ok, msg.version);
+        break;
+      case 'bridgeInsertReferenceAck':
+        // v0.5.0「引用到 DSH」回执：唤醒等待中的插入请求（按 requestId 配对）
+        this.settleInsert(msg.requestId, msg.ok, msg.reason, msg.inserted);
         break;
     }
   }
@@ -193,7 +231,70 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
       reply: async (m) => {
         await this.view?.webview.postMessage(m);
       },
+      // v0.4.3 Diff：读 turn-end 侧（磁盘当前内容）、旧侧存入内存文档、开原生 diff 视图。
+      // 不落临时文件——用户工作区多是 Perforce/SVN 工作副本，落文件会污染其变更列表。
+      readFileText: async (p) => await nodeFs.readFile(p, 'utf8'),
+      putBeforeDoc: (text, baseName) => this.diffDocs.put(text, baseName).toString(),
+      openDiff: async (beforeUri, afterPath, title) => {
+        // preview:false 保留标签页；左侧是内存快照（本轮改动前），右侧是磁盘现有文件。
+        // 标题明确标出左侧是「本轮改动前」的快照，避免用户误以为它是磁盘上的文件。
+        await vscode.commands.executeCommand(
+          'vscode.diff',
+          vscode.Uri.parse(beforeUri),
+          vscode.Uri.file(afterPath),
+          beforeDocLabel(title),
+          { preview: false },
+        );
+      },
     };
+  }
+
+  /**
+   * v0.5.0「引用到 DSH」：把一批绝对路径作为 @ 引用芯片插入当前会话输入框。
+   *
+   * 流程：扩展命令 → 本方法（下行 bridgeInsertReference）→ 顶层脚本 → iframe 桥接
+   * → DSH 原生 conversation.input.addFiles → 回执原路返回。任何一步不通都给明确原因，
+   * 由调用方提示用户（绝不静默失败）。
+   *
+   * @param entries 绝对路径条目（目录需带 directory: true）
+   * @param timeoutMs 等待页面回执的超时（默认 8s，覆盖 DSH 页面冷启动/未握手场景）
+   * @returns 机读结果；页面未就绪/超时/桥接未生效都返回 ok=false 及原因
+   */
+  async insertReferences(entries: InsertReferenceEntry[], timeoutMs = 8000): Promise<InsertReferenceResult> {
+    if (entries.length === 0) return { ok: false, reason: 'no-reference' };
+    const view = this.view;
+    if (!view) return { ok: false, reason: 'no-panel' };
+    // 面板不在 ready（加载中/失败/占位页）时没有 iframe 可投递，直接给明确原因而不是干等超时
+    if (this.manager.getSnapshot().state !== 'ready') return { ok: false, reason: 'not-ready' };
+    if (this.pendingExternalUrl === null && this.remoteWindowDisabled()) return { ok: false, reason: 'not-ready' };
+    const requestId = randomUUID();
+    const result = new Promise<InsertReferenceResult>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingInserts.delete(requestId);
+        resolve({ ok: false, reason: 'page-timeout' });
+      }, timeoutMs);
+      this.pendingInserts.set(requestId, { resolve, timer });
+    });
+    try {
+      await view.webview.postMessage(buildInsertReferenceMessage(requestId, entries));
+    } catch {
+      this.settleInsert(requestId, false, 'post-failed');
+    }
+    return result;
+  }
+
+  /** 用 iframe 回执结算一条插入请求（幂等：已结算/已超时的 requestId 直接忽略） */
+  private settleInsert(requestId: string, ok: boolean, reason?: string, inserted?: number): void {
+    const pending = this.pendingInserts.get(requestId);
+    if (!pending) return;
+    this.pendingInserts.delete(requestId);
+    clearTimeout(pending.timer);
+    pending.resolve(ok ? { ok: true, inserted: inserted ?? 0 } : { ok: false, reason: reason ?? 'insert-failed' });
+  }
+
+  /** 面板销毁时清偿所有等待中的插入请求（否则命令会悬挂到超时） */
+  private abandonPendingInserts(reason: string): void {
+    for (const [requestId] of this.pendingInserts) this.settleInsert(requestId, false, reason);
   }
 
   /** 剪贴板桥接：扩展宿主写系统剪贴板，完成后回执给 webview（由顶层脚本转发给 iframe） */

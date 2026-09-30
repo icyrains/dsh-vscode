@@ -1,3 +1,117 @@
+## [0.5.0] - 2026-09-29
+
+### 新增
+
+- **在 VS Code 里右键把文件「引用到 DSH」**。在资源管理器、编辑器标签页、编辑器正文三处右键，
+  选中的文件/文件夹会直接变成当前 DSH 会话输入框里的一个 `@` **引用芯片**，随后可继续打字发送——
+  与「把文件拖进输入框」完全同效，不必再手打 `@` 路径。支持多选批量引用。
+  - **为什么不是塞纯文本**：DSH 的 `@` 引用是 Lexical 的原子节点（`ReferenceChipNode`），不是普通文本。
+    伪造等价节点要触达其内部构造、版本一变即碎；而 DSH 自己就有正规入口——
+    `conversation.input.shell(sessionId).addFiles(references, ids)` 正是 DSH「拖拽文件进输入框」
+    调用的**同一个方法**（见 `ui-conversation` 的 `addFiles` → `draftEditor.insertFileReferences`）。
+    调用它得到的芯片与原生拖拽逐字节一致，且自带图标、撤销栈、粘贴与发送语义。
+  - **相对路径按「会话工作目录」解析，不是 VS Code 工作区根**：扩展只传绝对路径，
+    页面侧用会话 `cwd` 相对化（复刻 DSH 的 `relativizeToCwd` 与 `formatFileMention` 规则）。
+    多根工作区/远程场景下两者并不一致，若按 VS Code 根解析就会指错文件。
+  - **当前会话如何确定**：优先 `uiWorkspace.selection`（持久化于 `dsh.sessions.current`，
+    是主视图真正的驱动源），仅当它不可用/指向已消失会话时才退回 DOM 的 `[data-conversation-session]`。
+    这样既不硬依赖 `uiWorkspace` 服务，也不会在服务缺失时彻底失效。
+  - **失败绝不静默**：定不到会话、输入框未就绪、正在发送而拒绝插入、面板未打开、页面超时……
+    每个分支都有明确文案（机读原因 + 用户可读文案两层），并写进扩展日志。
+  - **桥接仍需重载窗口**：插入逻辑跑在 DSH 页面内的桥接 bundle 里，属扩展侧改动，
+    需 `Developer: Reload Window` 后生效。
+
+### 测试
+
+测试用例由 328 增至 364（新增 36 条：相对化/mention/载荷生成等纯逻辑 25 条，
+面板转发链路的静态守卫 1 条，以及在**真实构建产物**上运行、断言「确实调用了 DSH 原生 `addFiles`」的端到端 10 条）。
+`npm run typecheck` 无错误，`npm test` 364/364 全绿
+（CI 为 Ubuntu；本机 Windows 另有 39 条**既有**环境性失败——硬编码 POSIX 路径的用例在 Windows 上必然失败、
+`dsh` 不在 PATH 的真实链路用例，与本次改动无关，改动前后数量一致）。
+
+端到端测试钉住了本功能的核心设计：引用必须以原子芯片插入（走 `addFiles`），
+而不是模拟键盘/粘贴往输入框塞文本——若将来有人改成后者，测试会因 `addFiles` 不再被调用而失败。
+
+## [0.4.3] - 2026-09-29
+
+### 新增
+
+- **「本轮文件改动」Diff 可在 VS Code 中查看**。此前 DSH 的改动对比（`changes-review` 视图）只在网页里渲染，
+  用户无法用 VS Code 的原生 diff 编辑器看同一处改动。现在在对话里的「本轮文件改动」卡片上点击任一文件行，
+  即用 `vscode.diff` 打开「该轮起始内容 ↔ 磁盘当前内容」，标题取 DSH 的展示路径。
+  - **旧侧全文如何得到**：`/api/changes.diff` 只返回 hunks（**不给完整的前后文件文本**，且刻意隐藏 cwd 与快照树 id，
+    `ChangesSummary = Pick<WorkspaceChangesSummary, 'turn'|'files'|'total'|'added'|'deleted'>`）。但 unified diff 的
+    语义是精确的——hunk 之外的行两侧逐字节相同。因此以磁盘当前内容为 turn-end 侧、按 hunk 反向还原 turn-start 全文，
+    做到**逐字节精确**，无需任何新接口。还原算法已与 DSH 真实的 `compareText`（`structuredPatch`，`context: 3`）
+    交叉验证 13/13（含新增/删除整个文件、CRLF、多 hunk、coarse 降级）。
+  - **坐标如何得到**：`seq` 只存在于 React 闭包（`changes.seq`），**DOM 里完全没有**，单靠 DOM 无法构造该端点参数。
+    故桥接旁路观察 DSH 自己发出的 `changes.summary` / `changes.diff` 请求（本插件本就 patch 了 `window.fetch`），
+    从服务端 JSON 取权威坐标与 hunks。该路径不依赖任何 CSS Module 哈希类名，也无需解析本地化文案。
+  - **旧侧不落任何文件**：用自定义 scheme（`dsh-diff-before`）+ `TextDocumentContentProvider`
+    把旧侧全文放在内存里（与 git 扩展的 `gitfs` 同套路）。这样既不污染 Perforce/SVN 工作副本
+    （用户工作区多为版本控制工作副本，落文件会被显示为「未纳管的新文件」、甚至有误提交风险），
+    也避免「打开后即删」把 diff 视图拖成「文件已删除」。内存仓库有条数与总字节双上限
+    （200 条 / 64 MiB），按最旧优先淘汰，长时间使用不会无界增长。
+    为保留语法高亮，内存文档的 URI 仍带原文件名。`binary` / `oversized` 无 hunks 时
+    退回「直接打开该文件」，绝不静默失败。
+
+### 修复
+
+- **相对路径改按「当前 DSH 会话工作区」解析**（0.4.2 的错误方向回退）。0.4.2 移除了工作区同步后，桥接不再发送
+  `cwd`（源码注释写着「会话 cwd 不再维护」），于是面板里点击相对路径只能用 VS Code 工作区根兜底——
+  当 DSH 会话的工作目录与 VS Code 工作区不同（或在 A/B 两个工作区之间切换会话）时会解析到错误位置。
+  现改为：点击时从 DOM 取当前会话 id（`[data-conversation-session]` / `[data-sidebar-right-session]`），
+  经 cordis 的 `sessions` 服务惰性查该会话的 `cwd` 并随消息下发；扩展侧 `resolveBridgePath` 本就优先用
+  `sessionCwd`，因此 A 工作区的会话解析到 A、B 会话解析到 B，切换即时生效。
+  - **刻意不声明 `dsh.client.inject: ['sessions']`**：硬依赖一旦不满足会让整个桥接（含外链跳转、剪贴板、
+    图片降级）都无法挂载。改为 `apply(ctx)` 存下上下文、点击时惰性解析，服务不可用时只是退回工作区根。
+  - 注意：DSH 的会话列表快照**没有** `current` 字段（实证 `SessionListState = { ids, byId, phase, projectionsBySession }`），
+    因此「当前会话」必须以 DOM 为准，不能用快照猜。
+
+### 测试
+
+测试用例由 284 增至 328（新增 44 条：改动坐标解析、`changes.diff` 形状校验、旧侧还原算法、内存旧侧文档、
+有界缓存、hunks 前缀严格校验、`openDiff` 消息构造与消息处理链路）。`npm run typecheck` 无错误，
+`npm test` 328/328 全绿
+（CI 为 Ubuntu；本机 Windows 另有 39 条**既有**环境性失败——硬编码 POSIX 路径的用例在 Windows 上必然失败、
+`dsh` 不在 PATH 的真实链路用例，与本次改动无关，改动前后数量一致）。
+
+另有一项**随机化属性测试**用于验证旧侧还原算法的逐字节精确性（见 `probe-results/`）：
+以 DSH 自己依赖树里的 `diff` 随机生成 **6000 组** before/after（含多 hunk、纯增、纯删、空文件、CRLF、
+极端行内容），断言 `reconstructBefore` 能精确还原 `terminated(before)`，实测 `failures=0`。
+
+### 修复（代码审查发现）
+
+本地改动经过一轮对抗性代码审查，修掉以下**会导致静默错误展示**的问题（均附带回归测试，
+其中两条新测试已用「临时回退成旧逻辑 → 测试必须失败」的方式验证过确实能抓到问题）：
+
+- **磁盘不再是该轮的 turn-end 时，绝不展示 Diff**。DSH 的 hunks 由**两个 git 快照树**算出
+  （`dsh-workspace-changes` 的 `readSide` → `case 'snapshot'` → `treeBlob`），而扩展只能读**当前磁盘**。
+  该轮之后文件再被改过（下一轮编辑、手动改、格式化、`git checkout`、外部工具）时，
+  反推出的 turn-start 会「看起来合理但完全错误」。现按 hunk 的 `newStart` 把上下文行/新增行
+  逐行锚回磁盘做一致性校验（`afterSideMatchesHunks`），不符则提示原因并**改为直接打开文件**。
+  实测反例：6 行文件只改第 5 行、之后顶部插入一行 → 旧行为会展示
+  `INSERTED l2 l3 l4 l5 l6 l6` 这种凭空捏造的内容。
+- **不再把「读失败」当成「内容为空」**。旧实现 `catch { afterText = '' }` 会在文件被删除/改名后
+  **静默截断**左栏（只剩 hunk 行体，20 行文件显示成 7 行）。现区分二者：读失败 → 可见提示；
+  只有 `after === false`（该轮确实删除了文件）才用空串，且此时不读盘。
+- **同一文件在多轮都被改过时，不再张冠李戴**。旧逻辑用卡片文件路径做指纹、歧义时取**最新 seq**，
+  于是点第 1 轮的卡片会显示第 3 轮的 diff。现改用**精确轮次号**消歧：卡片由 deliverables 注入
+  `conversation.chat.turnTail` 插槽，宿主把该轮 turn 写在 `data-turn-tail` 上，
+  与服务端 summary 的 `turn` 同源。`matchChangesSeq` 遇到多条同样对齐时**返回 null（判为歧义）**
+  而非取最新；无法确定时保留 DSH 原生行为。
+- **左栏行尾与末尾换行对齐右栏**。DSH 比较前会 `terminated()` 两侧并把快照行规整为 `\n`，
+  所以「行尾是 `\r\n` 还是 `\n`」「是否以换行结尾」这两个信息**不在 payload 上**。
+  固定用 `\n` + 补末尾换行会让 CRLF 文件或无末尾换行的文件出现**满屏假差异**。
+  现沿用右栏（磁盘）的实际形态；磁盘一致性校验也刻意对行尾不敏感
+  （本机 `core.autocrlf=true`，否则所有 CRLF 文件都会被误判为「已被再次修改」）。
+- **连点不再触发重复动作**。首次取数完成前的第二次点击会再次走「缓存未命中」分支，
+  弹出多个 diff 标签页；现加 in-flight 去重集合。
+- **diff 缓存同时按字节设限**。单条 diff 可达「两侧各 ≤2 MiB」量级，只按条数（500）限最坏会占用
+  上 GB 堆；现增加 64 MiB 总字节上限（与扩展侧 `DiffDocStore` 的 64 MiB 一致）。
+- 顺带把 `beforeDocLabel` 真正接上（此前是「已导出并单测、但无人调用」的死代码），
+  现在 Diff 标签页标题会标出「↔（本轮改动前）」；并修掉 `host.ts` 里重复的 `/**` 文档注释。
+
 ## [0.4.2] - 2026-09-28
 
 > 版本号说明：原计划的 `0.4.1.1` 是四段式版本号，VS Code 扩展清单不接受

@@ -461,6 +461,443 @@ export function resolveFetchUrl(input) {
   return '';
 }
 
+// —— v0.4.3：把「本轮文件改动」的 Diff 在 VS Code 中打开（坐标解析 + turn-start 全文反推） ——
+// 背景：DSH 的 review 视图只在网页内渲染，用户无法在 VS Code 里看同一处改动。
+// 关键约束（源码实证，dsh-client-ui-deliverables / dsh-workspace-changes）：
+//  · `/api/changes.diff` 只返回 hunks，**不给完整的前后文件文本**，且刻意隐藏 cwd 与快照树 id；
+//  · 卡片行按钮的 DOM 里没有 seq（它只活在 React 闭包），因此坐标要靠调用方另行解析。
+// 但 unified diff 的语义是精确的：hunk 之外的行两侧逐字节相同。于是可以
+// 「以磁盘当前内容为 turn-end 侧 + hunks 反向还原 turn-start 全文」，做到逐字节精确。
+
+/** DSH「本轮改动摘要」端点（document-relative：相对当前文档，无前导斜杠） */
+export const CHANGES_SUMMARY_ROUTE = 'api/changes.summary';
+
+/** DSH「单文件前后对比」端点（document-relative） */
+export const CHANGES_DIFF_ROUTE = 'api/changes.diff';
+
+/**
+ * 从 URL 解析 DSH 改动端点的坐标。
+ * 用于旁路观察 DSH 自己发出的 `changes.summary` / `changes.diff` 请求——
+ * 这是 review 标签页里唯一能稳定拿到 `seq` 的途径（DOM 不含 seq）。
+ *
+ * @param url 请求 URL（绝对或相对均可）
+ * @param base 相对 URL 的解析基准（浏览器传 document.baseURI）
+ * @returns `{ route, sessionId, seq, index? }`；非本端点或缺少必需参数时返回 null
+ */
+export function parseChangesQuery(url, base) {
+  if (typeof url !== 'string' || url === '') return null;
+  let parsed;
+  try {
+    parsed = new URL(url, typeof base === 'string' && base !== '' ? base : undefined);
+  } catch {
+    return null;
+  }
+  // 容忍前导斜杠与任意部署前缀：只看路径末尾的端点名
+  const path = parsed.pathname.replace(/\/+$/, '');
+  const route = path.endsWith('/' + CHANGES_DIFF_ROUTE) || path === CHANGES_DIFF_ROUTE
+    ? 'diff'
+    : path.endsWith('/' + CHANGES_SUMMARY_ROUTE) || path === CHANGES_SUMMARY_ROUTE
+      ? 'summary'
+      : '';
+  if (route === '') return null;
+  const sessionId = parsed.searchParams.get('sessionId') ?? '';
+  const seqRaw = parsed.searchParams.get('seq') ?? '';
+  if (sessionId === '' || seqRaw === '') return null;
+  const seq = Number(seqRaw);
+  if (!Number.isInteger(seq) || seq < 0) return null;
+  if (route === 'summary') return { route, sessionId, seq };
+  const indexRaw = parsed.searchParams.get('index') ?? '';
+  const index = Number(indexRaw);
+  if (!Number.isInteger(index) || index < 0) return null;
+  return { route, sessionId, seq, index };
+}
+
+/**
+ * 校验 `/api/changes.diff` 的 JSON 形状是否可直接转发给扩展宿主。
+ * 这里只做「够用即转」的轻校验（拒绝明显不合规的载荷），权威校验在扩展宿主侧。
+ * @param value 页面从 `/api/changes.diff` 读到的 JSON
+ * @returns 是否可转发
+ */
+export function isWorkspaceFileDiff(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (value.kind !== 'text') return false;
+  if (typeof value.path !== 'string' || value.path === '') return false;
+  return Array.isArray(value.hunks);
+}
+
+/**
+ * 构造「在 VS Code 中打开 Diff」上行消息。
+ * 只转发 DSH 服务端的原始 diff 载荷（hunks）；turn-start 全文由扩展宿主
+ * 读磁盘 current 内容后反推（见 src/bridge/host.ts 的 reconstructBefore），
+ * 保证「还原算法」只有一份实现且有单测覆盖。
+ *
+ * @param req.path 改动文件路径（相对会话 cwd，或工作区外绝对路径）
+ * @param req.cwd 会话工作目录（相对路径解析基准）
+ * @param req.diff `/api/changes.diff` 的原始 JSON
+ * @param req.display 展示路径（diff 标题用）
+ */
+export function buildOpenDiffMessage(req) {
+  const msg = { kind: 'openDiff', path: req.path, diff: req.diff };
+  if (typeof req.cwd === 'string' && req.cwd !== '') msg.cwd = req.cwd;
+  if (typeof req.display === 'string' && req.display !== '') msg.display = req.display;
+  return msg;
+}
+
+/**
+ * 「本轮文件改动」卡片容器选择器（DSH 的稳定 data 属性，非 CSS Module 哈希类名）。
+ * 卡片内的按钮既可能是单文件表头，也可能是多文件的行。
+ */
+export const CHANGED_FILES_CARD_SELECTOR = '[data-changed-files]';
+
+/** review 标签页容器选择器（右侧栏的改动对比视图） */
+export const CHANGES_REVIEW_SELECTOR = '[data-changes-review]';
+
+/** review 标签页里「当前文件」选择按钮（其 `data-review-file` 即相对路径） */
+export const REVIEW_FILE_SELECTOR = '[data-review-file]';
+
+/** 右侧栏容器：其 `data-sidebar-right-session` 给出该栏所属会话 id */
+export const SIDEBAR_RIGHT_SESSION_SELECTOR = '[data-sidebar-right-session]';
+
+/** 会话根容器：其 `data-conversation-session` 给出当前会话 id（用于解析相对路径基准） */
+export const CONVERSATION_SESSION_SELECTOR = '[data-conversation-session]';
+
+/**
+ * 「本轮」容器选择器：其 `data-turn-tail=<turn>` 给出该卡片所属的**轮次号**。
+ *
+ * 这是把「改动卡片」精确对到「某一轮 summary」的**唯一可靠**依据：
+ * 卡片由 deliverables 插件注入 `conversation.chat.turnTail` 插槽
+ * （实证 `dsh-client-ui-deliverables/lib/client.js` 的 `ctx.slots.inject("conversation.chat.turnTail", …)`），
+ * 而该插槽的宿主 `TurnTailNodeView` 会把 `data.turn` 写到外层 div 上
+ * （实证 `dsh-client-ui-chat/lib/client.js`：`"data-turn-tail": data.turn`，
+ *  传给插槽的上下文也是同一个 `turn`）。
+ * 服务端 summary 的 `turn` 字段来自同一个 turn 编号
+ * （`workspace-changes`：`session.append('workspace/changes', { turn: state.turn })`）。
+ *
+ * 为什么不能只靠文件路径对齐：同一文件在多轮里都被改时，各轮的文件指纹完全相同，
+ * 按「路径全对齐 + 取最新 seq」必然把旧卡片解析到最新一轮，从而显示别的轮次的 diff。
+ */
+export const TURN_TAIL_SELECTOR = '[data-turn-tail]';
+
+/**
+ * 从卡片向上读出它所属的轮次号。
+ * @param el 卡片内的任意元素（只要求 closest / getAttribute）
+ * @returns 轮次号；读不到返回 null
+ */
+export function findTurn(el) {
+  if (el === null || el === undefined || typeof el.closest !== 'function') return null;
+  let host;
+  try {
+    host = el.closest(TURN_TAIL_SELECTOR);
+  } catch {
+    return null;
+  }
+  if (!host || typeof host.getAttribute !== 'function') return null;
+  const raw = host.getAttribute('data-turn-tail');
+  if (typeof raw !== 'string' || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * 按轮次号从候选里选出唯一命中项。
+ * @param candidates `[{ seq, summary }]`（summary 带 `turn`）
+ * @param turn 卡片所属轮次号（来自 {@link findTurn}）
+ * @returns 恰好命中一个时返回它；0 个或多个返回 null
+ */
+export function matchChangesTurn(candidates, turn) {
+  if (!Array.isArray(candidates) || !Number.isFinite(turn)) return null;
+  let hit = null;
+  for (const c of candidates) {
+    if (!c || typeof c !== 'object') continue;
+    const summary = c.summary;
+    const t = summary && typeof summary === 'object' ? summary.turn : undefined;
+    if (!Number.isFinite(t) || t !== turn) continue;
+    if (hit !== null) return null; // 同一轮出现多个候选：不猜
+    hit = { seq: c.seq, summary };
+  }
+  return hit;
+}
+
+/**
+ * 从元素向上找出它所属的会话 id。
+ * 实证（DSH 0.2.0-rc.1）：聊天区根节点带 `data-conversation-session=<sessionId>`；
+ * 右侧栏容器带 `data-sidebar-right-session=<sessionId>`。二者都是稳定 data 属性，
+ * 不依赖 CSS Module 哈希类名——因此比按类名匹配健壮得多。
+ *
+ * 注意：DSH 的会话列表快照（`sessions.list.getSnapshot()`）**没有** current 字段
+ * （实证 `SessionListState = { ids, byId, phase, projectionsBySession }`），
+ * 所以「当前会话」必须以 DOM 为准，不能用快照猜。
+ *
+ * @param el 起始元素（只要求 closest / getAttribute）
+ * @returns 会话 id；找不到返回 ''
+ */
+export function findSessionId(el) {
+  if (el === null || el === undefined || typeof el.closest !== 'function') return '';
+  const conv = el.closest(CONVERSATION_SESSION_SELECTOR);
+  if (conv && typeof conv.getAttribute === 'function') {
+    const v = conv.getAttribute('data-conversation-session');
+    if (typeof v === 'string' && v !== '') return v;
+  }
+  const side = el.closest(SIDEBAR_RIGHT_SESSION_SELECTOR);
+  if (side && typeof side.getAttribute === 'function') {
+    const v = side.getAttribute('data-sidebar-right-session');
+    if (typeof v === 'string' && v !== '') return v;
+  }
+  return '';
+}
+
+/**
+ * 从「本轮文件改动」卡片里的按钮解析该文件的 index。
+ * 实证：行按钮带 `aria-describedby="<useId>-<index>"`，单文件表头只带 `<useId>`
+ * （对应 index 0）。这是唯一直达 DOM 的坐标，且不受类名哈希影响。
+ *
+ * @param btn 卡片内的按钮元素
+ * @returns files 数组下标（解析不出时按 0，与 DSH 表头语义一致）
+ */
+export function changedFileIndexOf(btn) {
+  if (btn === null || btn === undefined || typeof btn.getAttribute !== 'function') return 0;
+  const described = btn.getAttribute('aria-describedby');
+  if (typeof described !== 'string' || described === '') return 0;
+  const m = /-(\d+)$/.exec(described);
+  if (m === null) return 0;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n >= 0 ? n : 0;
+}
+
+/**
+ * 构造 `changes.diff` 的 document-relative 取数 URL（与 DSH 客户端一致）。
+ * @param sessionId 会话 id
+ * @param seq `workspace/changes` 事件序号
+ * @param index files 数组下标
+ */
+export function changesDiffUrl(sessionId, seq, index) {
+  return (
+    CHANGES_DIFF_ROUTE +
+    '?' +
+    new URLSearchParams({ sessionId, seq: String(seq), index: String(index) }).toString()
+  );
+}
+
+/**
+ * 从会话列表快照里取某会话的工作目录（相对路径解析基准）。
+ * @param snapshot `sessions.list.getSnapshot()` 的返回值（形状不合法时返回 undefined）
+ * @param sessionId 目标会话 id
+ * @returns 工作目录绝对路径；无则 undefined
+ */
+export function sessionCwdFrom(snapshot, sessionId) {
+  if (!snapshot || typeof snapshot !== 'object') return undefined;
+  if (typeof sessionId !== 'string' || sessionId === '') return undefined;
+  const byId = snapshot.byId;
+  if (!byId || typeof byId !== 'object') return undefined;
+  const row = byId[sessionId];
+  if (!row || typeof row !== 'object') return undefined;
+  const cwd = row.cwd;
+  return typeof cwd === 'string' && cwd !== '' ? cwd : undefined;
+}
+
+/**
+ * 有界 Map：超过上限时按插入顺序淘汰最旧的条目。
+ * 为什么需要：桥接的 summary/diff 缓存挂在长生命周期页面上（面板一开就是几小时），
+ * 若无限增长会随会话轮次持续吃内存。用一个很小的上限即可覆盖用户实际会点的窗口，
+ * 又保证内存有界。
+ *
+ * 注意先删后插：`Map` 迭代按插入序，删除再设可使被重新访问的键移到队尾
+ * （semantics 接近 LRU，避免「最热的那轮改动」被误淘汰）。
+ */
+export class BoundedMap {
+  /**
+   * @param limit 条目上限（≤0 视为 1）
+   * @param sizeOf 可选：单条目「大小」估算函数；给了就同时按总大小淘汰。
+   *   为什么需要：单条 diff 可以是「两侧各 ≤2 MiB」量级（DSH 默认 maxFileBytes=2 MiB），
+   *   只按条数限（如 500 条）最坏会占住约 2 GiB 堆。面板一开就是几小时，必须同时按字节兜住。
+   * @param maxBytes 总大小上限（仅在提供 sizeOf 时生效；≤0 视为不限）
+   */
+  constructor(limit, sizeOf, maxBytes) {
+    this.limit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 1;
+    this.sizeOf = typeof sizeOf === 'function' ? sizeOf : null;
+    this.maxBytes = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : 0;
+    this.map = new Map();
+    this.bytes = 0;
+  }
+
+  /** 单条目大小（未提供 sizeOf 时为 0） */
+  measure(value) {
+    if (this.sizeOf === null) return 0;
+    const n = this.sizeOf(value);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  get(key) {
+    return this.map.get(key);
+  }
+
+  set(key, value) {
+    // 先删再插 → 命中过的键排到队尾，淘汰时优先舍弃最久未写过的
+    const existing = this.map.get(key);
+    if (existing !== undefined || this.map.has(key)) {
+      this.bytes -= this.measure(existing);
+      this.map.delete(key);
+    }
+    this.map.set(key, value);
+    this.bytes += this.measure(value);
+    this.evict();
+    return this;
+  }
+
+  /** 按条数与总字节双上限淘汰最旧条目（至少保留 1 条，避免刚放进去就被清掉） */
+  evict() {
+    while (
+      this.map.size > this.limit ||
+      (this.maxBytes > 0 && this.bytes > this.maxBytes && this.map.size > 1)
+    ) {
+      const oldest = this.map.keys().next();
+      if (oldest.done === true) break;
+      this.bytes -= this.measure(this.map.get(oldest.value));
+      this.map.delete(oldest.value);
+    }
+    if (this.bytes < 0) this.bytes = 0;
+  }
+
+  has(key) {
+    return this.map.has(key);
+  }
+
+  get size() {
+    return this.map.size;
+  }
+
+  /** 当前总大小（未提供 sizeOf 时恒为 0） */
+  get totalBytes() {
+    return this.bytes;
+  }
+
+  /** 按插入顺序枚举（与 Map 一致），供「取某会话最新一轮」之类的遍历使用 */
+  entries() {
+    return this.map.entries();
+  }
+}
+
+/** JSON 载荷的字节估算：用来给 diff 缓存做字节上限（不需要精确，量级对即可） */
+export function jsonByteSize(value) {
+  try {
+    const s = JSON.stringify(value);
+    return typeof s === 'string' ? s.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** 改动坐标的缓存键（summary 与 diff 都用它） */
+export function changesKey(sessionId, seq) {
+  return sessionId + '|' + String(seq);
+}
+
+/**
+ * 「本轮文件改动」卡片里的「展开/收起全部」按钮选择器。
+ * 实证：该 disclosure 控件带 `aria-expanded`，而文件行/表头按钮都不带。
+ * 必须排除它——否则点「展开全部 5 个文件」会被误当成点击第一个文件。
+ */
+export const CHANGES_TOGGLE_SELECTOR = '[aria-expanded]';
+
+/**
+ * 判断某元素是否应被排除出「文件行」语义。
+ * @param el 候选按钮
+ * @returns true 表示是展开/收起控件等非文件行元素
+ */
+export function isChangesToggle(el) {
+  if (el === null || el === undefined || typeof el.matches !== 'function') return false;
+  try {
+    return el.matches(CHANGES_TOGGLE_SELECTOR);
+  } catch {
+    return false;
+  }
+}
+
+/** 把路径分隔符统一成 '/'，便于跨平台做尾部比较 */
+function normalizeSlashes(s) {
+  return s.replace(/[\\/]+/g, '/');
+}
+
+/**
+ * `absolute` 是否以 `relative` 结尾（**按完整路径段**，不区分分隔符风格）。
+ * 用于把卡片里读到的「绝对路径」与摘要里的「相对路径」对上号，
+ * 避免在浏览器侧做完整的路径拼接（不需要 node:path）。
+ *
+ * 必须按段比较：朴素的 endsWith 会让 `/ws/src/ab.ts` 命中相对路径 `b.ts`，
+ * 从而把不同文件误判为同一个、进而对齐到错误的改动轮次。
+ */
+export function pathTailMatches(absolute, relative) {
+  if (typeof absolute !== 'string' || typeof relative !== 'string') return false;
+  if (absolute === '' || relative === '') return false;
+  const a = normalizeSlashes(absolute);
+  const r = normalizeSlashes(relative);
+  if (a === r) return true;
+  // 绝对形式的 relative（以 / 开头或带盘符）直接比较，不再补前导斜杠
+  if (r.startsWith('/') || /^[a-zA-Z]:\//.test(r)) return a === r;
+  return a.endsWith('/' + r);
+}
+
+/**
+ * 在同会话的多个改动轮次（summary 候选）里，找出与「当前卡片」是同一轮的那个。
+ *
+ * 为什么需要：一个会话可以有多轮改动，卡片也就会有多个。若一律取最新一轮，
+ * 在向上滚动点击旧卡片时会取到错误的 diff。
+ * 做法：卡片各行经 aria-describedby → 隐藏 span 能读到该文件的**绝对路径**；
+ * 摘要里该文件是**相对会话 cwd 的路径**。用「尾段匹配」逐项对齐打分，
+ * 只有全部对齐（score === 卡片文件数）才认这一轮，否则返回 null 由调用方兜底。
+ *
+ * @param candidates `[{ seq, summary }]` 同会话的全部候选
+ * @param cardPaths 当前卡片按 index 顺序的绝对路径
+ * @returns 命中的候选（含 score）；无法确定时 null
+ */
+export function matchChangesSeq(candidates, cardPaths) {
+  if (!Array.isArray(candidates) || !Array.isArray(cardPaths) || cardPaths.length === 0) return null;
+  let best = null;
+  let ambiguous = false;
+  for (const c of candidates) {
+    if (!c || typeof c !== 'object') continue;
+    const summary = c.summary;
+    const files = summary && typeof summary === 'object' ? summary.files : undefined;
+    if (!Array.isArray(files) || files.length < cardPaths.length) continue;
+    let score = 0;
+    for (let i = 0; i < cardPaths.length; i += 1) {
+      const rel = files[i] && typeof files[i] === 'object' ? files[i].path : undefined;
+      if (typeof rel === 'string' && pathTailMatches(cardPaths[i], rel)) score += 1;
+    }
+    // 全部对齐才算命中
+    if (score !== cardPaths.length) continue;
+    if (best === null) {
+      best = { seq: c.seq, summary };
+      continue;
+    }
+    // 多个候选取同样对齐：**绝不能**按「取最新 seq」决定——同一文件在多轮里都被改时
+    // 各轮指纹完全相同，取最新会把旧卡片显示成最新一轮的 diff（张冠李戴）。
+    // 这里改为判为「无法确定」，由调用方优先用轮次号消歧、否则拒绝（退回原生行为）。
+    ambiguous = true;
+  }
+  return ambiguous ? null : best;
+}
+
+/**
+ * 从「本轮改动摘要」JSON 里取出第 index 个文件的路径信息。
+ * 摘要来自 `/api/changes.summary`（`ChangesSummary = {turn, files, total, added, deleted}`，
+ * 其中 `files[].path` 相对会话 cwd，`display` 为展示用路径）。
+ * 用服务端摘要而非 DOM 文案取路径，可完全避开 CSS Module 哈希类名与本地化文案。
+ *
+ * @param summary 摘要 JSON
+ * @param index files 数组下标
+ * @returns `{ path, display }`；取不到返回 null
+ */
+export function changedFileAt(summary, index) {
+  if (!summary || typeof summary !== 'object') return null;
+  const files = summary.files;
+  if (!Array.isArray(files)) return null;
+  const f = files[index];
+  if (!f || typeof f !== 'object') return null;
+  if (typeof f.path !== 'string' || f.path === '') return null;
+  return { path: f.path, display: typeof f.display === 'string' ? f.display : f.path };
+}
+
 /**
  * 把 RPC 响应重新打包为「携带指定 rpcId」的新 Response。
  * 图片降级重发会使用新 rpcId（避免与服务端已处理请求撞车），而重发响应需要以
@@ -481,5 +918,200 @@ export async function rewriteRpcId(response, rpcId) {
     statusText: response.statusText,
     headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' },
   });
+}
+
+// ——————————————————————————————————————————————————————————————
+// v0.5.0：VS Code 右键「引用到 DSH」
+//
+// 目标：把 VS Code 里选中的文件插入当前 DSH 会话的输入框，形式与 DSH 自身
+// 「把文件拖进输入框」完全一致——一个原子引用芯片（Lexical ReferenceChipNode），
+// 而非纯文本。用户无需再手打 @ 路径。
+//
+// 关键设计：扩展侧只传「绝对路径 + 是否目录」，**不**传相对路径。
+// 因为相对路径的基准必须是「该 DSH 会话的工作目录」（见 v0.4.3 的同类修复），
+// 而不是 VS Code 的工作区根：两者在多根工作区/远程场景下会不一致。
+// 页面侧才有会话 cwd（sessions 服务），所以相对化在页面内完成，
+// 并直接复用 DSH 自己的相对化与 mention 规则（见下），保证产物与原生拖拽逐字节一致。
+// ——————————————————————————————————————————————————————————————
+
+/** 单次引用插入的批量上限（防止误选上千文件时把输入框塞爆） */
+export const MAX_REFERENCE_BATCH = 50;
+
+/**
+ * 把绝对路径相对化到会话工作目录——复刻 DSH 的 `relativizeToCwd` 语义。
+ *
+ * 为什么要复刻：DSH 原生拖拽走的正是这个函数，只有语义一致，右键插入的芯片才与
+ * 拖拽产生的芯片指向同一路径。
+ *
+ * 与 DSH 的一处**有意差异**（且已测）：这里比较前把两侧分隔符统一为 `/`。
+ * DSH 只做裸 startsWith 比较，从不归一化，因此它对「cwd 为反斜杠、路径为正斜杠」的
+ * 混合输入会静默放弃相对化，退回绝对路径。这在 DSH 内部不会出问题（它自己的拖拽
+ * 两端同风格），但本桥接的输入天然混合：`cwd` 来自 DSH 会话（Windows 上可能是
+ * `C:\ws`），绝对路径来自 VS Code（`uri.fsPath`，Windows 上同为反斜杠）。
+ * 不归一化就会在 Windows 上产出 `@C:/ws/a.ts` 这种绝对引用，与原生拖拽的 `@a.ts`
+ * 不一致。归一化对 DSH 自身能产生的输入不改变任何结果，只是让本桥接的输入也正确。
+ * 输出一律 `/` 分隔（DSH 的路径词汇与 mention 约定）。
+ *
+ * 保持 DSH 的另一项语义：路径恰好等于 cwd 时**照原样返回**（不返回空串），
+ * 于是「右键工作区根目录」会得到 `@<绝对路径>/` 这一有效引用，而不是静默无操作。
+ *
+ * @param text 绝对路径
+ * @param cwd 会话工作目录（可为 undefined/空，表示未知）
+ * @returns cwd 之下的相对路径；不在 cwd 之下时返回归一化后的路径
+ */
+export function relativizeToCwd(text, cwd) {
+  if (typeof text !== 'string') return '';
+  const normalized = text.replace(/\\/g, '/');
+  if (cwd === undefined || cwd === null || cwd === '') return normalized;
+  const root = String(cwd).replace(/\\/g, '/').replace(/\/+$/, '');
+  if (root === '') return normalized;
+  if (normalized.startsWith(`${root}/`)) return normalized.slice(root.length + 1);
+  return normalized;
+}
+
+/**
+ * 把路径转成 `@path` mention——复刻 DSH 的 `formatFileMention`（kind='file' 分支）。
+ *
+ * DSH 对目录的拖拽插入走的是「路径先补尾斜杠、再按 file 规则加引号」，
+ * 因此含空格的目录得到闭合引号 `@"dir/"`（而不是补全菜单里那种故意不闭合的 `@"dir/`）。
+ * 本函数接收的 path 已由调用方补好尾斜杠。
+ *
+ * @param path 相对或绝对路径（`/` 分隔，目录已带尾斜杠）
+ * @returns mention 文本；路径含控制字符或 `"`（编辑器语法无法安全表示）时返回 undefined
+ */
+export function formatFileMention(path) {
+  if (typeof path !== 'string' || path === '') return undefined;
+  if (/[\u0000-\u001f\u007f-\u009f"]/u.test(path)) return undefined;
+  if (!/\s/u.test(path)) return `@${path}`;
+  return `@"${path}"`;
+}
+
+/** 取路径最后一段（`/` 或 `\` 分隔均支持；目录尾斜杠先剥掉） */
+export function pathBasename(path) {
+  if (typeof path !== 'string') return '';
+  const trimmed = path.replace(/[/\\]+$/, '');
+  const idx = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  return idx < 0 ? trimmed : trimmed.slice(idx + 1);
+}
+
+/**
+ * 校验并规范化扩展侧传来的引用条目。
+ *
+ * 只接受 `{ path, directory? }` 形状：path 必须是非空字符串，directory 为真值表示目录。
+ * 反斜杠统一转 `/`（DSH 的路径词汇一律正斜杠）。非法条目直接丢弃而不是抛错——
+ * 一个坏条目不该让整批引用失败。
+ *
+ * @param entries 来自扩展侧（未完全可信）的数组
+ * @returns 规范化后的 `{ absPath, directory }` 数组
+ */
+export function normalizeReferenceEntries(entries) {
+  if (!Array.isArray(entries)) return [];
+  const out = [];
+  for (const entry of entries) {
+    if (out.length >= MAX_REFERENCE_BATCH) break;
+    if (entry === null || typeof entry !== 'object') continue;
+    const raw = entry.path;
+    if (typeof raw !== 'string') continue;
+    const absPath = raw.trim().replace(/\\/g, '/');
+    if (absPath === '') continue;
+    out.push({ absPath, directory: entry.directory === true });
+  }
+  return out;
+}
+
+/**
+ * 把规范化条目转成 DSH 原生的引用插入载荷（`conversation.input.shell().addFiles` 的第一参数）。
+ *
+ * 字段与 DSH `ui-conversation` 的拖拽代码逐项对齐：
+ *   source='reference'、ref=mention、label=文件名（目录带尾斜杠）、
+ *   appearance='folder'|'file'、clipboardText=mention。
+ * 顺序即数组顺序（芯片按用户选择顺序插入）。
+ *
+ * @param entries `normalizeReferenceEntries` 的输出
+ * @param cwd 当前 DSH 会话的工作目录
+ * @returns 原生插入载荷数组；mention 无法表示（含控制字符等）的条目被跳过
+ */
+export function buildReferenceInsertions(entries, cwd) {
+  const refs = [];
+  for (const { absPath, directory } of entries) {
+    const relative = relativizeToCwd(absPath, cwd);
+    if (relative === '') continue; // 恰好等于 cwd：不是一个可引用的文件
+    const withSlash = directory ? `${relative.replace(/\/+$/, '')}/` : relative;
+    const mention = formatFileMention(withSlash);
+    if (mention === undefined) continue;
+    const name = pathBasename(withSlash);
+    const label = directory ? `${name === '' ? withSlash : name}/` : name === '' ? withSlash : name;
+    refs.push({
+      source: 'reference',
+      ref: mention,
+      label,
+      appearance: directory ? 'folder' : 'file',
+      clipboardText: mention,
+    });
+  }
+  return refs;
+}
+
+/**
+ * 构造「插入引用」下行请求（扩展宿主 → webview 顶层脚本）。
+ *
+ * 注意两个方向的形状不同、都有意如此：
+ *   - 扩展 → 顶层脚本：`{ type:'bridgeInsertReference', … }`（与本扩展其它下行消息同一套 type 词汇）
+ *   - 顶层脚本 → iframe：`{ kind:'insertReference', … }`（桥接内部 kind 词汇，由顶层脚本构造）
+ * 两段都按各自既有约定走，避免为了"统一"去改动既有的消息路由。
+ */
+export function buildInsertReferenceMessage(requestId, entries) {
+  return { type: 'bridgeInsertReference', requestId, entries };
+}
+
+/**
+ * 构造「插入引用」回执（iframe 页面 → 父页面 → 扩展宿主）。
+ *
+ * ok=true 表示芯片已真的插入输入框；否则带 reason 供扩展侧提示用户
+ * （扩展侧把它翻成可读文案，页面侧只报机读原因）。
+ *
+ * @param requestId 与请求一致的关联 id
+ * @param ok 是否插入成功
+ * @param reason 失败原因（ok=true 时省略）
+ * @param inserted 实际插入的芯片数量（ok=true 时给出，便于日志对账）
+ */
+export function buildInsertReferenceAck(requestId, ok, reason, inserted) {
+  const base = { kind: 'insertReferenceAck', requestId, ok: ok === true };
+  if (base.ok) return typeof inserted === 'number' ? { ...base, inserted } : base;
+  return typeof reason === 'string' && reason !== '' ? { ...base, reason } : base;
+}
+
+/**
+ * 解析并校验「插入引用」下行消息。
+ *
+ * @param data 父页面投递的消息体
+ * @returns `{ requestId, entries }`；形状不合法（缺 requestId / 无可插入条目）时返回 null
+ */
+export function parseInsertReferenceMessage(data) {
+  if (data === null || typeof data !== 'object') return null;
+  if (data.kind !== 'insertReference') return null;
+  if (typeof data.requestId !== 'string' || data.requestId === '') return null;
+  const entries = normalizeReferenceEntries(data.entries);
+  if (entries.length === 0) return null;
+  return { requestId: data.requestId, entries };
+}
+
+/**
+ * 从会话列表快照里取出「当前应插入到哪个会话」。
+ *
+ * 优先用 uiWorkspace 的 selection（持久化在 `dsh.sessions.current`，是主视图真正的驱动源），
+ * 仅当它不可用/指向已消失的会话时，才退回 DOM 可见的 `[data-conversation-session]`。
+ * 这样桥接既不需要硬依赖 uiWorkspace 服务，也不会在服务缺失时彻底失效。
+ *
+ * @param selection uiWorkspace.selection.getSnapshot() 的值（可能为 undefined）
+ * @param domSessionId DOM 兜底扫描得到的会话 id（可能为空串）
+ * @returns 会话 id；都拿不到时返回空串
+ */
+export function resolveTargetSessionId(selection, domSessionId) {
+  if (selection !== null && typeof selection === 'object') {
+    const id = selection.sessionId;
+    if (typeof id === 'string' && id !== '') return id;
+  }
+  return typeof domSessionId === 'string' ? domSessionId : '';
 }
 

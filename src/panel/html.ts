@@ -15,6 +15,8 @@ export type PanelMessage =
   | { type: 'showLogs' }
   | { type: 'bridgeOpenExternal'; url: string }
   | { type: 'bridgeOpenFile'; path: string; cwd?: string }
+  /** v0.4.3：把「本轮文件改动」的 Diff 用 VS Code 原生 diff 视图打开（diff 为服务端原始载荷） */
+  | { type: 'bridgeOpenDiff'; path: string; diff: unknown; cwd?: string; display?: string }
   | { type: 'bridgeCopyText'; text: string; requestId: string }
   | { type: 'bridgeReadText'; requestId: string }
   | { type: 'bridgeReadTextAck'; requestId: string; ok: boolean; text?: string }
@@ -24,6 +26,9 @@ export type PanelMessage =
   | { type: 'bridgeSaveImageAck'; requestId: string; ok: boolean; path?: string }
   | { type: 'bridgeDeleteImages'; requestId: string; paths: string[] }
   | { type: 'bridgeDeleteImagesAck'; requestId: string; ok: boolean }
+  /** v0.5.0：VS Code 右键「引用到 DSH」——把文件作为 @ 引用芯片插入当前会话输入框 */
+  | { type: 'bridgeInsertReference'; requestId: string; entries: { path: string; directory?: boolean }[] }
+  | { type: 'bridgeInsertReferenceAck'; requestId: string; ok: boolean; reason?: string; inserted?: number }
   /** 需要登录引导页：用户粘贴外部启动的 DSH 启动网址后提交（扩展校验并兑换会话） */
   | { type: 'authSubmitLaunchUrl'; url: string };
 
@@ -163,8 +168,25 @@ if (iframeEl) {
       iframeEl.contentWindow.postMessage({ kind: 'deleteImagesAck', requestId: d.requestId, ok: d.ok }, '*');
       return;
     }
+    // v0.5.0 引用插入：扩展侧右键「引用到 DSH」→ 转发给 iframe 执行原生引用插入。
+    // 仅透传 requestId 与 entries（形状校验在 iframe 侧 parseInsertReferenceMessage）。
+    if (d && d.type === 'bridgeInsertReference' && typeof d.requestId === 'string' && Array.isArray(d.entries)) {
+      iframeEl.contentWindow.postMessage({ kind: 'insertReference', requestId: d.requestId, entries: d.entries }, '*');
+      return;
+    }
     // —— 上行：iframe 发来的消息，source + origin 双重校验 ——
     if (e.source !== iframeEl.contentWindow || !isAllowedBridgeOrigin(e.origin)) return;
+    // v0.5.0 引用插入回执：转发给扩展，供其提示成功/失败（扩展按 requestId 配对等待中的请求）
+    if (d && d.kind === 'insertReferenceAck' && typeof d.requestId === 'string' && typeof d.ok === 'boolean') {
+      vscode.postMessage({
+        type: 'bridgeInsertReferenceAck',
+        requestId: d.requestId,
+        ok: d.ok,
+        ...(typeof d.reason === 'string' ? { reason: d.reason } : {}),
+        ...(typeof d.inserted === 'number' ? { inserted: d.inserted } : {}),
+      });
+      return;
+    }
     // 握手回执：统一形状 { kind:'bridgeAck', ok }（不带 token 字段），只读 ok
     if (d && d.kind === 'bridgeAck') {
       bridgeAcked = true;
@@ -180,6 +202,17 @@ if (iframeEl) {
     // 打开文件：转发给扩展 → showTextDocument（携带可选 cwd）
     if (d && d.kind === 'openFile' && typeof d.path === 'string') {
       vscode.postMessage({ type: 'bridgeOpenFile', path: d.path, cwd: typeof d.cwd === 'string' ? d.cwd : undefined });
+      return;
+    }
+    // 打开 Diff：转发给扩展 → 还原 turn-start 全文后用 VS Code 原生 diff 视图打开（v0.4.3）
+    if (d && d.kind === 'openDiff' && typeof d.path === 'string' && d.diff && typeof d.diff === 'object') {
+      vscode.postMessage({
+        type: 'bridgeOpenDiff',
+        path: d.path,
+        diff: d.diff,
+        ...(typeof d.cwd === 'string' ? { cwd: d.cwd } : {}),
+        ...(typeof d.display === 'string' ? { display: d.display } : {}),
+      });
       return;
     }
     // 复制文本：转发给扩展 → vscode.env.clipboard.writeText（跨源 iframe 原生剪贴板 API 被 VS Code 拦截）

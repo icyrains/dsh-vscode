@@ -2,13 +2,14 @@
 import * as vscode from 'vscode';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { readFileSync } from 'node:fs';
-import { initI18n, t } from './i18n';
+import { readFileSync, statSync } from 'node:fs';
+import { initI18n, t, type MsgKey } from './i18n';
 import { readConfig, buildChildEnv, type DshConfig } from './config';
 import { probeService } from './service/detect';
 import { createProcessRunner, findInPath, findInPathPosix, resolveDshPackageJsonPath } from './service/process';
 import { ServiceManager, type ManagerOptions } from './service/manager';
 import { DshPanelProvider } from './panel/provider';
+import { registerDiffDocProvider } from './bridge/diff-doc';
 import { StatusBarController } from './statusbar';
 import { resolveWorkspaceRoot } from './workspaceRoot';
 import { createUrlResolver, handshakeTimeoutMs, bridgeEvalDelayMs, classifyRemote, toLocalhostUrl } from './remote';
@@ -597,6 +598,9 @@ export function activate(context: vscode.ExtensionContext): void {
     asExternalUri: async (uri) => await vscode.env.asExternalUri(vscode.Uri.parse(uri.toString())),
   });
 
+  // v0.4.3：Diff 旧侧的内存文档仓库（左右两个面板共用；随扩展停用释放）
+  const diffDocs = registerDiffDocProvider(context.subscriptions);
+
   // 左右两侧各一个 provider 实例，共享同一 manager（服务状态一致）
   panelPrimary = new DshPanelProvider(
     manager,
@@ -611,6 +615,7 @@ export function activate(context: vscode.ExtensionContext): void {
     resolveExternalUrl, // resolveExternalUrl：远程窗口的 URL 隧道解析
     imageFallbackGetter, // imageFallback：dsh.image.fallback 驱动图片降级
     panelUi(), // 会话三态 / 代理地址覆盖 / 登录提交（DSH ≥0.1.2 鉴权适配）
+    diffDocs, // v0.4.3：Diff 旧侧内存文档（不落临时文件）
   );
   panelSecondary = new DshPanelProvider(
     manager,
@@ -622,8 +627,8 @@ export function activate(context: vscode.ExtensionContext): void {
     resolveExternalUrl,
     imageFallbackGetter,
     panelUi(),
-  );
-  panels.push(panelPrimary, panelSecondary);
+    diffDocs, // v0.4.3：与主面板共用同一份旧侧文档仓库
+  );  panels.push(panelPrimary, panelSecondary);
   new StatusBarController(manager);
 
   // 服务就绪后启动握手超时（若面板已打开）；并执行会话判定/兑换（自启自动、外部服务→登录引导页）
@@ -655,6 +660,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dsh.bridge.retry', () => void retryBridge()),
     vscode.commands.registerCommand('dsh.bridge.uninstall', () => void uninstallBridgeCmd()),
     vscode.commands.registerCommand('dsh.cleanupImageCache', () => void cleanupImageCacheCmd()),
+    // v0.5.0「引用到 DSH」：资源管理器/编辑器标签页/编辑器正文右键均可触发。
+    // 资源管理器传入 Uri[]（支持多选批量），编辑器正文入口传资源 URI 或不传。
+    vscode.commands.registerCommand('dsh.referenceToDsh', (uri?: vscode.Uri, uris?: vscode.Uri[]) =>
+      void referenceToDsh(pickReferenceUris(uri, uris)),
+    ),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('dsh')) onConfigChanged();
     }),
@@ -749,6 +759,113 @@ async function cleanupImageCacheCmd(): Promise<void> {
     removed = 0;
   }
   void vscode.window.showInformationMessage(t('msg.imageCacheCleaned', { count: removed }));
+}
+
+/**
+ * 归拢右键菜单的各种调用形状，得到本次要引用的 Uri 列表。
+ *
+ * VS Code 各入口传参并不统一：
+ *   - 资源管理器：`(uri, uris)`，多选时 uris 含全部选中项；
+ *   - 编辑器标签页：`(uri)`；
+ *   - 编辑器正文：不传参（回退当前活动编辑器）。
+ * 资源管理器多选时以 uris 为准（uri 只是「被点的那个」），并按路径去重，
+ * 避免同一文件被重复插入成两个芯片。
+ */
+function pickReferenceUris(uri?: vscode.Uri, uris?: vscode.Uri[]): vscode.Uri[] | undefined {
+  const list = uris !== undefined && uris.length > 0 ? uris : uri !== undefined ? [uri] : [];
+  if (list.length === 0) return undefined;
+  const seen = new Set<string>();
+  const out: vscode.Uri[] = [];
+  for (const u of list) {
+    if (u.scheme !== 'file') continue; // 只处理真实文件系统条目
+    const key = u.fsPath;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(u);
+  }
+  return out.length === 0 ? undefined : out;
+}
+
+/**
+ * v0.5.0「引用到 DSH」：把 VS Code 里选中的文件/文件夹作为 @ 引用芯片插入当前 DSH 会话输入框。
+ *
+ * 设计要点：
+ *  - 只传**绝对路径**给页面。相对化的基准必须是「该 DSH 会话的工作目录」，而不是 VS Code
+ *    工作区根（多根工作区/远程场景下两者不一致，会指错文件）；会话 cwd 只有页面侧知道。
+ *  - 目标面板优先取用户当前可见的那个；两个都不可见时退而投递给任一已就绪面板，
+ *    并在成功后提示「已插入右侧面板」这类方位，避免用户找不到插入结果。
+ *  - 所有失败分支都有明确文案（含「桥接未生效」「页面未就绪」「找不到会话」等），
+ *    绝不静默——静默失败会让用户以为功能坏了。
+ */
+async function referenceToDsh(uris: vscode.Uri[] | undefined): Promise<void> {
+  // 右键菜单传 Uri；命令面板调用时无参 → 回退到当前活动编辑器
+  const picked = uris !== undefined && uris.length > 0 ? uris : editorUrisFallback();
+  if (picked.length === 0) {
+    void vscode.window.showWarningMessage(t('msg.noReferenceTarget'));
+    return;
+  }
+  const entries = picked.map((uri) => ({
+    path: uri.fsPath,
+    // 目录判定优先用文件系统类型（右键文件夹时 Uri 本身不携带该信息）
+    directory: isDirectoryUri(uri),
+  }));
+
+  // 目标面板：可见的优先（用户正看着它）；都不可见时用任一带 view 的面板
+  const candidates = [panelPrimary, panelSecondary].filter((p): p is DshPanelProvider => p !== null);
+  const target = candidates.find((p) => p.isVisible()) ?? candidates.find((p) => p.canReceiveCommands());
+  if (target === undefined) {
+    void vscode.window.showWarningMessage(t('msg.referenceNoPanel'));
+    return;
+  }
+
+  const result = await target.insertReferences(entries);
+  if (result.ok) {
+    void vscode.window.showInformationMessage(
+      result.inserted === 1
+        ? t('msg.referenceInsertedOne')
+        : t('msg.referenceInserted', { count: result.inserted }),
+    );
+    return;
+  }
+  appendLog(`[reference] 插入引用失败：${result.reason}（${entries.length} 项）`);
+  void vscode.window.showWarningMessage(t('msg.referenceFailed', { reason: referenceFailureText(result.reason) }));
+}
+
+/** 命令面板调用（无 Uri 参数）时的回退：当前活动编辑器所在文件 */
+function editorUrisFallback(): vscode.Uri[] {
+  const active = vscode.window.activeTextEditor;
+  if (active !== undefined && active.document.uri.scheme === 'file') return [active.document.uri];
+  return [];
+}
+
+/** 判断 Uri 是否指向目录（用文件系统 stat；失败时按「非目录」处理，与文件默认行为一致） */
+function isDirectoryUri(uri: vscode.Uri): boolean {
+  try {
+    // 同步 stat：右键菜单回调里要同步决定 directory 标记，异步会让「插入语义」依赖时序
+    const stat = statSync(uri.fsPath);
+    return stat.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** 把页面回的机读原因翻成用户可读文案（未识别的原因原样透出，便于报障） */
+function referenceFailureText(reason: string): string {
+  const known: Record<string, MsgKey> = {
+    'no-context': 'refReason.noContext',
+    'no-session': 'refReason.noSession',
+    'no-reference': 'refReason.noReference',
+    'no-composer': 'refReason.noComposer',
+    'no-panel': 'refReason.noPanel',
+    'not-ready': 'refReason.notReady',
+    'insert-failed': 'refReason.insertFailed',
+    'insert-refused': 'refReason.insertRefused',
+    'page-timeout': 'refReason.pageTimeout',
+    'post-failed': 'refReason.postFailed',
+    'panel-disposed': 'refReason.panelDisposed',
+  };
+  const key = known[reason];
+  return key === undefined ? reason : t(key);
 }
 
 /** 配置变更：host/port 变化时自动重启自启服务，退出策略实时生效 */
