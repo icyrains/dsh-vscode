@@ -21,3 +21,13 @@ credentials.yaml
 dsh-imgcache-*
 .dsh-e2e-home/
 .dsh-auth-mock/
+
+# 本机沙箱下 npm 的默认缓存在工作区外（会 EPERM），故改用仓库内缓存目录
+.npm-cache/
+
+# 本地开发期产物：不进版本库
+# .codegraph/：CodeGraph 本地索引（数 MB，与运行无关，可随时重建）
+.codegraph/
+# probe-results/：改动验证的一次性快照与探针脚本，含本机路径的测试日志；
+# 结论已沉淀到 LOCAL-FORK.md 与 CHANGELOG，可整体删除
+probe-results/

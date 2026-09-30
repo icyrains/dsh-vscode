@@ -24,8 +24,15 @@ dsh-imgcache-*
 .dsh-e2e-home/
 .dsh-auth-mock/
 .worktrees/
+# 本次排查用的一次性脚本与日志捕获（绝不入包）
+.scratch-*
+# 本地分支说明与排查证据（面向本机开发，不属于扩展产物）
+LOCAL-FORK.md
+probe-results/**
 # 环境残留目录（git worktree / npm 缓存 / 代码索引等）：不随扩展打包
 .worktrees/**
 .npm-cache/**
 .code-atlas/**
+# CodeGraph 本地索引（开发期产物，体积大且与运行无关）
+.codegraph/**
 .git/**
